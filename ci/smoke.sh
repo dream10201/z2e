@@ -9,6 +9,11 @@ echo "--- Intel GPU 用户态库 ---"
 ls -1 /usr/lib/x86_64-linux-gnu/ | grep -E "libze_intel_gpu|libigdrcl|libigdgmm|libze_loader"
 echo "--- OpenCL ICD ---"
 ls -1 /etc/OpenCL/vendors/
+# ICD 文件里写的路径必须真的存在，否则 clinfo 会静默认不到设备
+while read -r icd; do
+  echo "$icd -> $(cat "$icd")"
+  test -e "$(cat "$icd")" || { echo "ICD 指向的库不存在"; exit 1; }
+done < <(find /etc/OpenCL/vendors -name '*.icd')
 echo "--- ocloc ---"
 command -v ocloc >/dev/null && echo "ocloc ok"
 
