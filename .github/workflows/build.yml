@@ -71,20 +71,5 @@ jobs:
 
       - name: 冒烟测试
         run: |
-          IMG=$(echo '${{ steps.meta.outputs.tags }}' | head -1)
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            :
-          else
-            docker pull "$IMG"
-          fi
-          # runner 上没有 iGPU，只能验证驱动装齐 + OpenVINO 能起来
-          docker run --rm "$IMG" python -c "
-import openvino as ov
-core = ov.Core()
-print('OpenVINO', ov.__version__, 'devices:', core.available_devices)
-assert 'CPU' in core.available_devices
-import openvino_genai
-print('genai ok')
-"
-          docker run --rm --entrypoint bash "$IMG" -c \
-            'ls -1 /usr/lib/x86_64-linux-gnu/ | grep -E "libze_intel_gpu|libigdrcl|libigdgmm" && ls /etc/OpenCL/vendors/'
+          IMG=$(printf '%s\n' '${{ steps.meta.outputs.tags }}' | head -1)
+          docker run --rm -v "$PWD/ci:/ci:ro" "$IMG" bash /ci/smoke.sh
