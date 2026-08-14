@@ -1,0 +1,35 @@
+x-igpu: &igpu
+  # 把 iGPU 映射进来；RENDER_GID 取宿主机 `stat -c %g /dev/dri/renderD128`
+  devices:
+    - /dev/dri:/dev/dri
+  group_add:
+    - "${RENDER_GID:-993}"
+  volumes:
+    - ./models:/models
+  environment:
+    - OV_CACHE=/models/.ovcache
+    - HF_HOME=/models/.hf
+  shm_size: "2gb"
+
+services:
+  # 日常翻译
+  hunyuan-mt:
+    <<: *igpu
+    image: ghcr.io/dream10201/z2e:runtime
+    build:
+      context: .
+      target: runtime
+    container_name: hunyuan-mt
+    stdin_open: true
+    tty: true
+    command: ["python", "translate.py", "--device", "GPU"]
+
+  # 一次性：下载 HF 权重并量化成 INT4 IR
+  export:
+    <<: *igpu
+    image: ghcr.io/dream10201/z2e:export
+    build:
+      context: .
+      target: export
+    profiles: ["export"]
+    command: ["bash", "export_int4.sh"]

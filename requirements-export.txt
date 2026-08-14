@@ -1,0 +1,7 @@
+# 只在导出 INT4 IR 时需要；运行时不用
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.13.0
+optimum==2.3.0
+optimum-intel[openvino]==2.1.0
+nncf==3.3.0
+transformers==5.5.4
