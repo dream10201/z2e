@@ -46,7 +46,8 @@ FROM base AS runtime
 COPY requirements-runtime.txt /tmp/
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -U pip && pip install -r /tmp/requirements-runtime.txt
-COPY translate.py bench.py /app/
+COPY translate.py bench.py server.py /app/
+EXPOSE 8000
 CMD ["python", "translate.py", "--device", "GPU"]
 
 

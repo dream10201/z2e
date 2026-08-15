@@ -24,6 +24,31 @@ services:
     tty: true
     command: ["python", "translate.py", "--device", "GPU"]
 
+  # OpenAI 兼容 HTTP API，OpenAPI 文档在 /docs
+  api:
+    <<: *igpu
+    image: ghcr.io/dream10201/z2e:runtime
+    build:
+      context: .
+      target: runtime
+    container_name: hunyuan-mt-api
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      - OV_CACHE=/models/.ovcache
+      - HF_HOME=/models/.hf
+      - OV_DEVICE=${OV_DEVICE:-GPU}
+    command: ["python", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import json,urllib.request,sys; s=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health'))['status']; sys.exit(0 if s=='ok' else 1)"]
+      interval: 30s
+      timeout: 10s
+      # 首次在 GPU 上编译 kernel 要一两分钟，别让健康检查提前判死
+      start_period: 300s
+      retries: 3
+
   # 一次性：下载 HF 权重并量化成 INT4 IR
   export:
     <<: *igpu

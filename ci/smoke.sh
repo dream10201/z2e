@@ -30,4 +30,9 @@ print("devices:", devs)
 assert "CPU" in devs, "CPU 插件没起来"
 PY
 
+echo "--- HTTP API（stub 掉模型）---"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+cd /app 2>/dev/null || cd "$HERE/.."
+python "$HERE/test_api.py"
+
 echo "--- 冒烟通过 ---"
