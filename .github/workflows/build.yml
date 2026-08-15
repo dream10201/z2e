@@ -72,4 +72,16 @@ jobs:
       - name: 冒烟测试
         run: |
           IMG=$(printf '%s\n' '${{ steps.meta.outputs.tags }}' | head -1)
-          docker run --rm -v "$PWD/ci:/ci:ro" "$IMG" bash /ci/smoke.sh
+          # 绕过 entrypoint 的模型检查：runner 上没有模型，也不该在这儿下 15GB
+          docker run --rm -v "$PWD/ci:/ci:ro" --entrypoint bash "$IMG" /ci/smoke.sh
+
+      - name: entrypoint 在模型缺失时给出可操作的提示
+        run: |
+          IMG=$(printf '%s\n' '${{ steps.meta.outputs.tags }}' | head -1)
+          set +e
+          out=$(docker run --rm -e AUTO_EXPORT=0 "$IMG" python -c "print('不该跑到这')" 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          test $code -ne 0 || { echo "模型缺失时应该退非零"; exit 1; }
+          grep -q "找不到模型" <<<"$out" || { echo "没给出提示信息"; exit 1; }

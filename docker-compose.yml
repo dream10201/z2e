@@ -9,24 +9,22 @@ x-igpu: &igpu
   environment:
     - OV_CACHE=/models/.ovcache
     - HF_HOME=/models/.hf
+    - OV_DEVICE=${OV_DEVICE:-GPU}
+    # 国内下载慢可以设 HF_ENDPOINT=https://hf-mirror.com
+    - HF_ENDPOINT=${HF_ENDPOINT:-}
   shm_size: "2gb"
 
-services:
-  # 日常翻译
-  hunyuan-mt:
-    <<: *igpu
-    image: ghcr.io/dream10201/z2e:runtime
-    build:
-      context: .
-      target: runtime
-    container_name: hunyuan-mt
-    stdin_open: true
-    tty: true
-    command: ["python", "translate.py", "--device", "GPU"]
+# 一次性：下载 HF 权重并量化成 INT4 IR。模型已存在时秒退，
+# 所以让下面两个服务都 depends_on 它，第一次 up 会自动补上模型。
+x-needs-model: &needs-model
+  depends_on:
+    export:
+      condition: service_completed_successfully
 
+services:
   # OpenAI 兼容 HTTP API，OpenAPI 文档在 /docs
   api:
-    <<: *igpu
+    <<: [*igpu, *needs-model]
     image: ghcr.io/dream10201/z2e:runtime
     build:
       context: .
@@ -34,10 +32,6 @@ services:
     container_name: hunyuan-mt-api
     ports:
       - "${API_PORT:-8000}:8000"
-    environment:
-      - OV_CACHE=/models/.ovcache
-      - HF_HOME=/models/.hf
-      - OV_DEVICE=${OV_DEVICE:-GPU}
     command: ["python", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
     restart: unless-stopped
     healthcheck:
@@ -49,12 +43,21 @@ services:
       start_period: 300s
       retries: 3
 
-  # 一次性：下载 HF 权重并量化成 INT4 IR
+  # 命令行翻译: docker compose run --rm cli
+  cli:
+    <<: [*igpu, *needs-model]
+    image: ghcr.io/dream10201/z2e:runtime
+    build:
+      context: .
+      target: runtime
+    stdin_open: true
+    tty: true
+    command: ["python", "translate.py", "--device", "GPU"]
+
   export:
     <<: *igpu
     image: ghcr.io/dream10201/z2e:export
     build:
       context: .
       target: export
-    profiles: ["export"]
-    command: ["bash", "export_int4.sh"]
+    container_name: hunyuan-mt-export
