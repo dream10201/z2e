@@ -1,13 +1,26 @@
 #!/usr/bin/env bash
-# 把 Hunyuan-MT-7B 导出成 OpenVINO INT4 IR。只需跑一次，产物落在 $OUT。
+# 把一个 HF decoder-only 因果语言模型导出成 OpenVINO INT4 IR。
+# 产物目录由 MODEL_ID 派生：tencent/Hunyuan-MT-7B -> $MODELS_ROOT/Hunyuan-MT-7B-int4-ov
 # 一般不用手动调，容器 entrypoint 发现模型缺失会自动跑。
+#
+#   MODEL_ID=Qwen/Qwen3-8B bash export_int4.sh
 set -euo pipefail
 
 MODEL_ID="${MODEL_ID:-tencent/Hunyuan-MT-7B}"
-OUT="${OUT:-/models/Hunyuan-MT-7B-int4-ov}"
-export HF_HOME="${HF_HOME:-/models/.hf}"
+MODELS_ROOT="${MODELS_ROOT:-/models}"
+WEIGHT_FORMAT="${WEIGHT_FORMAT:-int4}"
+export HF_HOME="${HF_HOME:-$MODELS_ROOT/.hf}"
 # 国内可以设 HF_ENDPOINT=https://hf-mirror.com
 [ -n "${HF_ENDPOINT:-}" ] && echo "[export] 走镜像站 $HF_ENDPOINT"
+
+# 目录名派生规则要和 modelmgr.dir_name_for() 保持一致
+derive_out() {
+  local base="${MODEL_ID%/}"
+  base="${base##*/}"
+  base="$(printf '%s' "$base" | tr -c 'A-Za-z0-9._-' '-')"
+  printf '%s/%s-%s-ov' "$MODELS_ROOT" "$base" "$WEIGHT_FORMAT"
+}
+OUT="${OUT:-$(derive_out)}"
 
 if [ -f "$OUT/openvino_model.xml" ]; then
   echo "[skip] $OUT 已存在"
@@ -19,20 +32,23 @@ TMP="${OUT}.tmp"
 rm -rf "$TMP"
 mkdir -p "$(dirname "$OUT")"
 
-echo "[export] $MODEL_ID -> $OUT (int4 sym, group_size=128)"
+QUANT_ARGS=(--weight-format "$WEIGHT_FORMAT")
+if [ "$WEIGHT_FORMAT" = "int4" ]; then
+  QUANT_ARGS+=(--group-size "${GROUP_SIZE:-128}" --ratio "${RATIO:-1.0}" --sym)
+fi
+
+echo "[export] $MODEL_ID -> $OUT (${QUANT_ARGS[*]})"
 optimum-cli export openvino \
   --model "$MODEL_ID" \
-  --task text-generation-with-past \
-  --weight-format int4 \
-  --group-size "${GROUP_SIZE:-128}" \
-  --ratio "${RATIO:-1.0}" \
-  --sym \
+  --task "${EXPORT_TASK:-text-generation-with-past}" \
+  "${QUANT_ARGS[@]}" \
   --trust-remote-code \
   "$TMP"
 
 test -f "$TMP/openvino_model.xml" || { echo "[export] 产物缺 openvino_model.xml" >&2; exit 1; }
+printf '{"model_id": "%s", "weight_format": "%s"}\n' "$MODEL_ID" "$WEIGHT_FORMAT" > "$TMP/.z2e.json"
 mv "$TMP" "$OUT"
 
 echo "[done] -> $OUT"
 du -sh "$OUT"
-echo "[hint] HF 原始权重缓存在 $HF_HOME，确认没问题后可以删掉腾 ~15 GB"
+echo "[hint] HF 原始权重缓存在 $HF_HOME，确认没问题后可以删掉腾空间"

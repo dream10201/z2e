@@ -10,6 +10,10 @@ x-igpu: &igpu
     - OV_CACHE=/models/.ovcache
     - HF_HOME=/models/.hf
     - OV_DEVICE=${OV_DEVICE:-GPU}
+    # 换模型改这个就行；目录名自动派生（Qwen/Qwen3-8B -> Qwen3-8B-int4-ov）
+    - MODEL_ID=${MODEL_ID:-tencent/Hunyuan-MT-7B}
+    - MODELS_ROOT=/models
+    - WEIGHT_FORMAT=${WEIGHT_FORMAT:-int4}
     # 国内下载慢可以设 HF_ENDPOINT=https://hf-mirror.com
     - HF_ENDPOINT=${HF_ENDPOINT:-}
   shm_size: "2gb"
@@ -52,7 +56,7 @@ services:
       target: runtime
     stdin_open: true
     tty: true
-    command: ["python", "translate.py", "--device", "GPU"]
+    command: ["python", "translate.py", "--device", "${OV_DEVICE:-GPU}"]
 
   export:
     <<: *igpu

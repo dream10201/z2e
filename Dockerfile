@@ -46,7 +46,7 @@ FROM base AS runtime
 COPY requirements-runtime.txt /tmp/
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -U pip && pip install -r /tmp/requirements-runtime.txt
-COPY translate.py bench.py server.py docker-entrypoint.sh /app/
+COPY translate.py bench.py server.py modelmgr.py docker-entrypoint.sh /app/
 RUN chmod +x /app/docker-entrypoint.sh
 EXPOSE 8000
 # entrypoint 会先确认 INT4 模型在不在，不在就（在 export 镜像里）自动导出

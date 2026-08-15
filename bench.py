@@ -1,7 +1,8 @@
 #!/usr/bin/env python
-"""对比 CPU / iGPU 上 Hunyuan-MT-7B INT4 的实际吞吐。
+"""对比 CPU / iGPU 上同一个 INT4 模型的实际吞吐。
 
 python bench.py --devices CPU GPU --runs 2
+python bench.py --model Qwen/Qwen3-8B --devices GPU
 """
 import argparse
 import os
@@ -9,6 +10,7 @@ import time
 
 import openvino_genai as ov_genai
 
+import modelmgr
 from translate import DEFAULT_MODEL, build_prompt, make_pipe
 
 SAMPLES = [
@@ -19,7 +21,7 @@ SAMPLES = [
 
 
 def run(device: str, model: str, runs: int, max_new_tokens: int):
-    pipe = make_pipe(model, device, os.environ.get("OV_CACHE"))
+    pipe = make_pipe(str(modelmgr.dir_for(model)), device, os.environ.get("OV_CACHE"))
     cfg = ov_genai.GenerationConfig()
     cfg.max_new_tokens = max_new_tokens
     cfg.do_sample = False
@@ -27,7 +29,7 @@ def run(device: str, model: str, runs: int, max_new_tokens: int):
     tok = pipe.get_tokenizer()
     rows = []
     for text, tgt in SAMPLES:
-        p = build_prompt(text, tgt)
+        p = build_prompt(text, tgt, model)
         try:
             p = tok.apply_chat_template([{"role": "user", "content": p}], True)
         except Exception:
@@ -51,7 +53,7 @@ def run(device: str, model: str, runs: int, max_new_tokens: int):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default=os.environ.get("MODEL_DIR", DEFAULT_MODEL))
+    ap.add_argument("--model", default=DEFAULT_MODEL, help="目录名 / HF repo id / 绝对路径")
     ap.add_argument("--devices", nargs="+", default=["CPU", "GPU"])
     ap.add_argument("--runs", type=int, default=2)
     ap.add_argument("--max-new-tokens", type=int, default=128)

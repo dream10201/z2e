@@ -1,14 +1,19 @@
 #!/usr/bin/env python
-"""Hunyuan-MT-7B 的 HTTP 服务，OpenAI 兼容 + 一个更直白的翻译端点。
+"""OpenVINO GenAI 的 HTTP 服务：OpenAI 兼容 + 一个更直白的翻译端点。
+
+任何 decoder-only 因果语言模型都能跑（LLMPipeline 的适用范围）。
+请求里的 model 字段可以触发运行时切换——一次只驻留一个模型。
 
   POST /v1/chat/completions   OpenAI 兼容，支持 stream=true（SSE）
-  GET  /v1/models             OpenAI 兼容
+  GET  /v1/models             列出 /models 下已导出的模型
   POST /translate             {"text": "...", "to": "中文"} -> {"translation": "..."}
-  GET  /health                模型加载状态、设备
+  POST /admin/load            显式预热某个模型
+  POST /admin/pull            后台导出一个 HF 模型（需要 :export 镜像）
+  GET  /admin/pull            查导出进度
+  GET  /health                当前加载的模型、设备
   GET  /docs, /openapi.json   自动生成的 OpenAPI 文档
 
-启动: uvicorn server:app --host 0.0.0.0 --port 8000
-环境变量: MODEL_DIR / OV_DEVICE / OV_CACHE / OV_THREADS / MODEL_NAME
+环境变量: MODEL_ID / MODELS_ROOT / OV_DEVICE / OV_CACHE / OV_THREADS / WEIGHT_FORMAT
 """
 from __future__ import annotations
 
@@ -27,30 +32,32 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from translate import DEFAULT_MODEL, build_prompt, make_pipe
+import modelmgr
+from translate import DEFAULT_MODEL, build_prompt
 
-MODEL_DIR = os.environ.get("MODEL_DIR", DEFAULT_MODEL)
 DEVICE = os.environ.get("OV_DEVICE", "GPU")
-MODEL_NAME = os.environ.get("MODEL_NAME", "Hunyuan-MT-7B-int4-ov")
 
-# LLMPipeline 不是线程安全的，而且 N305 上并发解码只会互相拖慢。
-# 所以全局一把锁，请求串行处理。
-_pipe: ov_genai.LLMPipeline | None = None
-_lock = threading.Lock()
+_mgr = modelmgr.PipelineManager(DEVICE, os.environ.get("OV_CACHE"))
+_exporter = modelmgr.Exporter()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _pipe
-    _pipe = await asyncio.to_thread(make_pipe, MODEL_DIR, DEVICE, os.environ.get("OV_CACHE"))
+    # 启动时按 MODEL_ID 预热；没导出就先不加载，等请求指定或调 /admin/pull
+    entry = modelmgr.resolve(DEFAULT_MODEL)
+    if entry is None:
+        reg = modelmgr.scan()
+        entry = next(iter(reg.values()), None)
+    if entry is not None:
+        await asyncio.to_thread(_mgr.load, entry)
     yield
-    _pipe = None
+    _mgr.unload()
 
 
 app = FastAPI(
-    title="Hunyuan-MT-7B on OpenVINO",
-    version="1.0.0",
-    description="Hunyuan-MT-7B 翻译服务，INT4 权重，跑在 Intel iGPU / CPU 上。",
+    title="LLM on OpenVINO",
+    version="2.0.0",
+    description="decoder-only 因果语言模型服务，INT4 权重，跑在 Intel iGPU / CPU 上。",
     lifespan=lifespan,
 )
 
@@ -63,10 +70,10 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str = Field(default=MODEL_NAME, description="忽略，仅为兼容 OpenAI 客户端")
+    model: str | None = Field(default=None, description="留空用当前模型；给了就切过去")
     messages: list[ChatMessage]
     max_tokens: int | None = Field(default=512, ge=1, le=8192)
-    temperature: float = Field(default=0.0, ge=0.0, le=2.0, description="0 走贪心，翻译建议保持 0")
+    temperature: float = Field(default=0.0, ge=0.0, le=2.0, description="0 走贪心")
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
     stream: bool = False
     repetition_penalty: float = 1.05
@@ -75,6 +82,7 @@ class ChatCompletionRequest(BaseModel):
 class TranslateRequest(BaseModel):
     text: str = Field(description="待翻译文本")
     to: str = Field(default="中文", description="目标语言，如 中文 / English / 日本語")
+    model: str | None = Field(default=None, description="留空用当前模型")
     max_tokens: int = Field(default=512, ge=1, le=8192)
 
     model_config = {
@@ -86,6 +94,7 @@ class TranslateRequest(BaseModel):
 
 class TranslateResponse(BaseModel):
     translation: str
+    model: str
     tokens: int
     seconds: float
     tokens_per_second: float
@@ -94,12 +103,40 @@ class TranslateResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
-    model: str
-    model_dir: str
+    model: str | None
     device: str
+    models_root: str
+    available: list[str]
+    load_seconds: float
 
 
-# ---------- 推理 ----------
+class LoadRequest(BaseModel):
+    model: str = Field(description="目录名 / HF repo id")
+
+
+class PullRequest(BaseModel):
+    model: str = Field(description="HF repo id，例如 Qwen/Qwen3-8B")
+
+
+# ---------- 内部工具 ----------
+
+def _need(model_ref: str | None) -> modelmgr.ModelEntry:
+    """解析并（必要时）切换到目标模型，返回当前条目。"""
+    if model_ref:
+        entry = modelmgr.resolve(model_ref)
+        if entry is None:
+            avail = sorted(modelmgr.scan())
+            raise HTTPException(
+                404,
+                f"模型 {model_ref!r} 没导出。已有: {avail or '无'}。"
+                f"可以调 POST /admin/pull 后台导出（需要 :export 镜像）",
+            )
+        _mgr.load(entry)          # 已经是当前模型时是空操作
+        return entry
+    if _mgr.current is None:
+        raise HTTPException(503, "还没有加载任何模型，先调 POST /admin/load 或在请求里给 model")
+    return _mgr.current
+
 
 def _gen_config(max_tokens: int, temperature: float, top_p: float, rp: float):
     cfg = ov_genai.GenerationConfig()
@@ -115,19 +152,17 @@ def _gen_config(max_tokens: int, temperature: float, top_p: float, rp: float):
 
 
 def _apply_template(messages: list[dict[str, str]]) -> str:
-    assert _pipe is not None
     try:
-        return _pipe.get_tokenizer().apply_chat_template(messages, True)
+        return _mgr.pipe().get_tokenizer().apply_chat_template(messages, True)
     except Exception:
-        # 模板不可用就退化成拼接
+        # 模型没带 chat template 就退化成拼接
         return "\n".join(m["content"] for m in messages)
 
 
 def _generate(prompt: str, cfg) -> tuple[str, int, float]:
-    assert _pipe is not None
-    with _lock:
+    with _mgr.lock:
         t0 = time.perf_counter()
-        res = _pipe.generate(prompt, cfg)
+        res = _mgr.pipe().generate(prompt, cfg)
         dt = time.perf_counter() - t0
     try:
         n = res.perf_metrics.get_num_generated_tokens()
@@ -138,7 +173,6 @@ def _generate(prompt: str, cfg) -> tuple[str, int, float]:
 
 def _generate_stream(prompt: str, cfg) -> Iterator[str]:
     """在后台线程跑 generate，把 streamer 回调的分片透过队列吐出来。"""
-    assert _pipe is not None
     q: queue.Queue[str | None | BaseException] = queue.Queue()
 
     def cb(chunk: str):
@@ -147,8 +181,8 @@ def _generate_stream(prompt: str, cfg) -> Iterator[str]:
 
     def work():
         try:
-            with _lock:
-                _pipe.generate(prompt, cfg, cb)
+            with _mgr.lock:
+                _mgr.pipe().generate(prompt, cfg, cb)
         except BaseException as e:  # 把异常带回主线程，别让请求悬住
             q.put(e)
         finally:
@@ -168,31 +202,67 @@ def _generate_stream(prompt: str, cfg) -> Iterator[str]:
 
 @app.get("/health", response_model=HealthResponse, tags=["ops"])
 def health():
+    cur = _mgr.current
     return HealthResponse(
-        status="ok" if _pipe is not None else "loading",
-        model=MODEL_NAME,
-        model_dir=MODEL_DIR,
+        status="ok" if cur is not None else "no-model",
+        model=cur.name if cur else None,
         device=DEVICE,
+        models_root=str(modelmgr.MODELS_ROOT),
+        available=sorted(modelmgr.scan()),
+        load_seconds=round(_mgr.load_seconds, 2),
     )
 
 
 @app.get("/v1/models", tags=["openai"])
 def list_models():
+    return {"object": "list", "data": [e.as_openai() for e in modelmgr.scan().values()]}
+
+
+@app.post("/admin/load", tags=["admin"])
+def load_model(req: LoadRequest):
+    entry = _need(req.model)
+    return {"loaded": entry.name, "device": DEVICE, "load_seconds": round(_mgr.load_seconds, 2)}
+
+
+@app.post("/admin/pull", tags=["admin"])
+def pull_model(req: PullRequest):
+    if not modelmgr.Exporter.available():
+        raise HTTPException(
+            501, "当前镜像没有导出依赖（torch/optimum/nncf），用 ghcr.io/dream10201/z2e:export"
+        )
+    if modelmgr.resolve(req.model) is not None:
+        return {"status": "done", "message": "已经导出过了"}
+    try:
+        job = _exporter.start(req.model)
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    return {"status": job.status, "model": job.model_id, "target": job.target,
+            "hint": "7B 大约 30-60 分钟，GET /admin/pull 查进度"}
+
+
+@app.get("/admin/pull", tags=["admin"])
+def pull_status():
+    job = _exporter.job
+    if job is None:
+        return {"status": "idle", "export_available": modelmgr.Exporter.available()}
     return {
-        "object": "list",
-        "data": [{"id": MODEL_NAME, "object": "model", "created": 0, "owned_by": "tencent"}],
+        "status": job.status,
+        "model": job.model_id,
+        "target": job.target,
+        "elapsed_seconds": round((job.finished or time.time()) - job.started, 1),
+        "message": job.message,
     }
 
 
 @app.post("/translate", response_model=TranslateResponse, tags=["translate"])
 def translate_ep(req: TranslateRequest):
-    if _pipe is None:
-        raise HTTPException(503, "模型还在加载")
-    prompt = _apply_template([{"role": "user", "content": build_prompt(req.text, req.to)}])
-    cfg = _gen_config(req.max_tokens, 0.0, 1.0, 1.05)
-    out, n, dt = _generate(prompt, cfg)
+    entry = _need(req.model)
+    hint = entry.source or entry.name
+    prompt = _apply_template([{"role": "user", "content": build_prompt(req.text, req.to, hint)}])
+    out, n, dt = _generate(prompt, _gen_config(req.max_tokens, 0.0, 1.0, 1.05))
     return TranslateResponse(
         translation=out.strip(),
+        model=entry.name,
         tokens=n,
         seconds=round(dt, 3),
         tokens_per_second=round(n / dt, 2) if dt > 0 else 0.0,
@@ -202,10 +272,9 @@ def translate_ep(req: TranslateRequest):
 
 @app.post("/v1/chat/completions", tags=["openai"])
 def chat_completions(req: ChatCompletionRequest):
-    if _pipe is None:
-        raise HTTPException(503, "模型还在加载")
     if not req.messages:
         raise HTTPException(400, "messages 不能为空")
+    entry = _need(req.model)
 
     prompt = _apply_template([m.model_dump() for m in req.messages])
     cfg = _gen_config(req.max_tokens or 512, req.temperature, req.top_p, req.repetition_penalty)
@@ -218,7 +287,7 @@ def chat_completions(req: ChatCompletionRequest):
             "id": cid,
             "object": "chat.completion",
             "created": created,
-            "model": req.model,
+            "model": entry.name,
             "choices": [{
                 "index": 0,
                 "message": {"role": "assistant", "content": out},
@@ -233,7 +302,7 @@ def chat_completions(req: ChatCompletionRequest):
                 "id": cid,
                 "object": "chat.completion.chunk",
                 "created": created,
-                "model": req.model,
+                "model": entry.name,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
             }
             return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
@@ -259,8 +328,5 @@ def chat_completions(req: ChatCompletionRequest):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(
-        app,
-        host=os.environ.get("HOST", "0.0.0.0"),
-        port=int(os.environ.get("PORT", "8000")),
-    )
+    uvicorn.run(app, host=os.environ.get("HOST", "0.0.0.0"),
+                port=int(os.environ.get("PORT", "8000")))

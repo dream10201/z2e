@@ -1,10 +1,12 @@
 #!/usr/bin/env python
-"""Hunyuan-MT-7B 翻译，走 OpenVINO GenAI（CPU 或 iGPU）。
+"""翻译 CLI，走 OpenVINO GenAI（CPU 或 iGPU）。
+
+任何 decoder-only 因果语言模型都能用；`--model` 收目录名、HF repo id 或绝对路径。
 
 用法:
-  python translate.py --device GPU                     # 交互式
-  echo "hello world" | python translate.py --to 中文    # 管道批处理
-  python translate.py --to English -f in.txt -o out.txt
+  python translate.py --device GPU                          # 交互式
+  echo "hello world" | python translate.py --to 中文         # 管道批处理
+  python translate.py --model Qwen/Qwen3-8B --to English -f in.txt -o out.txt
 """
 import argparse
 import os
@@ -14,16 +16,44 @@ from pathlib import Path
 
 import openvino_genai as ov_genai
 
-DEFAULT_MODEL = "/models/Hunyuan-MT-7B-int4-ov"
+DEFAULT_MODEL = os.environ.get("MODEL_DIR") or os.environ.get("MODEL_ID", "tencent/Hunyuan-MT-7B")
 
-# 模型卡给的两套 prompt：中文互译 / 非中文互译
-ZH_TMPL = "把下面的文本翻译成{tgt}，不要额外解释。\n\n{text}"
-XX_TMPL = "Translate the following segment into {tgt}, without additional explanation.\n\n{text}"
+# 翻译专用模型自带指定的 prompt 格式，用错了质量会掉。按模型名匹配 preset，
+# 认不出就退化成通用指令（对 Qwen / Llama 这类通用 instruct 模型足够）。
+TEMPLATE_PRESETS: dict[str, tuple[str, str]] = {
+    # 模型名关键字: (中文向模板, 其他语向模板)
+    "hunyuan-mt": (
+        "把下面的文本翻译成{tgt}，不要额外解释。\n\n{text}",
+        "Translate the following segment into {tgt}, without additional explanation.\n\n{text}",
+    ),
+    "seed-x": (
+        "Translate the following text into {tgt}:\n{text} <{tgt}>",
+        "Translate the following text into {tgt}:\n{text} <{tgt}>",
+    ),
+}
+GENERIC = (
+    "把下面的文本翻译成{tgt}，只输出译文，不要解释。\n\n{text}",
+    "Translate the following text into {tgt}. Output only the translation.\n\n{text}",
+)
 
 
-def build_prompt(text: str, tgt: str) -> str:
+def templates_for(model_hint: str | None) -> tuple[str, str]:
+    """环境变量优先，其次按模型名匹配 preset，最后退化到通用模板。"""
+    zh = os.environ.get("TRANSLATE_TEMPLATE_ZH")
+    xx = os.environ.get("TRANSLATE_TEMPLATE")
+    if zh or xx:
+        return (zh or xx or GENERIC[0], xx or zh or GENERIC[1])
+    key = (model_hint or "").lower()
+    for name, tmpl in TEMPLATE_PRESETS.items():
+        if name in key:
+            return tmpl
+    return GENERIC
+
+
+def build_prompt(text: str, tgt: str, model_hint: str | None = None) -> str:
+    zh_tmpl, xx_tmpl = templates_for(model_hint if model_hint is not None else DEFAULT_MODEL)
     zh_like = any(k in tgt for k in ("中文", "Chinese", "汉语"))
-    tmpl = ZH_TMPL if zh_like or _has_han(text) else XX_TMPL
+    tmpl = zh_tmpl if zh_like or _has_han(text) else xx_tmpl
     return tmpl.format(tgt=tgt, text=text.strip())
 
 
@@ -51,13 +81,14 @@ def make_pipe(model: str, device: str, cache: str | None):
     return pipe
 
 
-def translate(pipe, text: str, tgt: str, max_new_tokens: int, stream: bool):
+def translate(pipe, text: str, tgt: str, max_new_tokens: int, stream: bool,
+              model_hint: str | None = None):
     cfg = ov_genai.GenerationConfig()
     cfg.max_new_tokens = max_new_tokens
     cfg.do_sample = False          # 翻译走贪心，稳定可复现
     cfg.repetition_penalty = 1.05
 
-    prompt = build_prompt(text, tgt)
+    prompt = build_prompt(text, tgt, model_hint)
     tok = pipe.get_tokenizer()
     try:
         prompt = tok.apply_chat_template([{"role": "user", "content": prompt}], True)
@@ -97,7 +128,8 @@ def translate(pipe, text: str, tgt: str, max_new_tokens: int, stream: bool):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default=os.environ.get("MODEL_DIR", DEFAULT_MODEL))
+    ap.add_argument("--model", default=DEFAULT_MODEL,
+                    help="目录名 / HF repo id / 绝对路径")
     ap.add_argument("--device", default="GPU", help="GPU / CPU / AUTO")
     ap.add_argument("--to", dest="tgt", default="中文", help="目标语言，如 中文 / English / 日本語")
     ap.add_argument("--max-new-tokens", type=int, default=512)
@@ -107,7 +139,14 @@ def main():
     ap.add_argument("--cache", default=os.environ.get("OV_CACHE"))
     args = ap.parse_args()
 
-    pipe = make_pipe(args.model, args.device, args.cache)
+    import modelmgr
+
+    path = modelmgr.dir_for(args.model)
+    if not modelmgr.is_exported(path):
+        print(f"[error] {path} 里没有 openvino_model.xml；先导出: "
+              f"MODEL_ID={args.model} bash export_int4.sh", file=sys.stderr)
+        sys.exit(1)
+    pipe = make_pipe(str(path), args.device, args.cache)
     stream = not args.no_stream
 
     if args.file:
@@ -120,7 +159,8 @@ def main():
     if src is not None:
         # 按空行切段，逐段翻译，避免一次塞太长
         segs = [s for s in src.split("\n\n") if s.strip()]
-        outs = [translate(pipe, s, args.tgt, args.max_new_tokens, stream) for s in segs]
+        outs = [translate(pipe, s, args.tgt, args.max_new_tokens, stream, args.model)
+                for s in segs]
         text = "\n\n".join(outs)
         if args.out:
             Path(args.out).write_text(text, encoding="utf-8")
@@ -134,7 +174,7 @@ def main():
         except EOFError:
             break
         if line.strip():
-            translate(pipe, line, args.tgt, args.max_new_tokens, stream)
+            translate(pipe, line, args.tgt, args.max_new_tokens, stream, args.model)
 
 
 if __name__ == "__main__":
