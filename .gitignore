@@ -5,3 +5,6 @@ logs/
 __pycache__/
 *.pyc
 .env
+
+# 全局 gitignore 排除了 *.md，这里反选回来，否则 README 提交不上去
+!*.md
