@@ -9,12 +9,11 @@ Qwen / Llama / Mistral / Hunyuan / Seed-X 等。**不支持 seq2seq 翻译模型
 （NLLB、M2M100、Opus-MT、T5），GenAI 没有对应的 text2text pipeline，
 这类模型在导出阶段就会失败。
 
-镜像由 GitHub Actions 构建并推到 GHCR：
+镜像由 GitHub Actions 构建并推到 `ghcr.io/dream10201/z2e:latest`，
+压缩后约 **0.6 GB**，包含 Intel iGPU 驱动、OpenVINO GenAI 运行时和模型导出工具链。
 
-| Tag | 内容 | 大小 | 用途 |
-| --- | --- | --- | --- |
-| `ghcr.io/dream10201/z2e:runtime`（= `:latest`） | Intel iGPU 驱动 + openvino-genai | ~1 GB | 日常推理 |
-| `ghcr.io/dream10201/z2e:export` | 上面 + torch / optimum-intel / nncf | ~5 GB | 首次导出 INT4 模型（缺模型时自动导） |
+> 早前拆过 `:runtime` / `:export` 两个 tag，实测导出依赖只多约 340 MB（压缩），
+> 不值得为此多一套概念，已经合并。那两个 tag 仍作为别名指向同一个镜像。
 
 ## 快速开始
 
@@ -25,7 +24,7 @@ git clone https://github.com/dream10201/z2e && cd z2e
 echo "RENDER_GID=$(stat -c %g /dev/dri/renderD128)" > .env
 
 # 起服务。模型不在会自动先导出（下 ~15 GB 权重再量化，N305 上约 30-60 分钟），
-# 导完自动接着启动 API，不用你跑第二条命令。
+# 导完自动接着启动 API。
 docker compose up -d api
 docker compose logs -f            # 看导出进度
 ```
@@ -58,7 +57,7 @@ curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
 **一次只驻留一个模型**——N305 上也塞不下两个 7B。切换要卸载旧的再加载新的，
 GPU 上首次编译 kernel 一两分钟（之后走 `OV_CACHE`，几秒）。所以别在生产流量里频繁切。
 
-不想 shell 进容器也能加新模型（需要 `:export` 镜像）：
+不想 shell 进容器也能加新模型：
 
 ```bash
 curl localhost:8000/admin/pull -H 'Content-Type: application/json' \
@@ -77,6 +76,8 @@ echo "Edge inference cuts latency." | \
 docker compose run --rm cli python translate.py --device GPU --to English -f in.txt -o out.txt
 docker compose run --rm cli python bench.py --devices CPU GPU
 ```
+
+（`cli` 在 `cli` profile 下，`docker compose up` 不会连带起它。）
 
 ## HTTP API
 
@@ -130,27 +131,23 @@ curl localhost:8000/translate -H 'Content-Type: application/json' \
 **没有鉴权**，只监听容器内 0.0.0.0。别直接暴露到公网，要么绑
 `127.0.0.1:8000:8000`，要么前面挡一层反代。
 
-不想用 compose 的话，用 `:export` 镜像也是一条命令——它的 entrypoint 会先补上模型再执行你给的命令：
+不用 compose 也是一条命令，entrypoint 会先补上模型再启动服务：
 
 ```bash
-docker run -d --name llm-api --device /dev/dri \
-  --group-add "$(stat -c %g /dev/dri/renderD128)" \
+docker run -d --name z2e --device /dev/dri \
   -p 8000:8000 -v /your/path/models:/models \
   -e MODEL_ID=Qwen/Qwen3-8B \
-  ghcr.io/dream10201/z2e:export \
-  python -m uvicorn server:app --host 0.0.0.0 --port 8000
+  ghcr.io/dream10201/z2e
 ```
 
-模型齐了之后想换回小镜像（省 4 GB）随时可以：
+想跑别的命令就附在后面，模型检查照样先做：
 
 ```bash
-docker run --rm -it --device /dev/dri \
-  --group-add "$(stat -c %g /dev/dri/renderD128)" \
-  -v /your/path/models:/models \
-  ghcr.io/dream10201/z2e:runtime python translate.py --device GPU
+docker run --rm -it --device /dev/dri -v /your/path/models:/models \
+  ghcr.io/dream10201/z2e python translate.py --device GPU
 ```
 
-`:runtime` 里没有导出依赖，模型缺失时它不会硬跑，而是打印出上面几条可用命令后退出。
+已经知道模型在、不想让它自动下载，加 `-e AUTO_EXPORT=0`——这时模型缺失会直接拒绝启动。
 
 ## 关键点
 
@@ -160,14 +157,16 @@ Ubuntu 24.04 自带的版本也偏旧。镜像里直接装 `intel/compute-runtim
 再配 Ubuntu 自带的 `ocl-icd-libopencl1` + `libze1`。验证：
 
 ```bash
-docker run --rm --device /dev/dri --group-add "$(stat -c %g /dev/dri/renderD128)" \
-  ghcr.io/dream10201/z2e:runtime clinfo -l
+docker run --rm --device /dev/dri --entrypoint clinfo \
+  ghcr.io/dream10201/z2e -l
 # Platform #0: Intel(R) OpenCL Graphics
 #  `-- Device #0: Intel(R) UHD Graphics
 ```
 
-**`--group-add` 不能省。** 容器里的进程要属于宿主机 `/dev/dri/renderD128` 的属主组
-才打得开设备，光 `--device` 映射进去会得到 permission denied。
+**`--group-add` 多数情况下并不必需。** 只有「容器以非 root 用户运行」**且**
+「宿主机 `renderD128` 是 0660」两个条件同时成立时才需要它。容器默认以 root 跑，
+root 有 `CAP_DAC_OVERRIDE`，直接绕过权限位；另外不少系统上 `renderD128` 是 0666，
+谁都能开。留着它是为了将来给镜像加 `USER`、或换到权限更严的机器时不会挂。
 
 **iGPU 没有独立显存**，走系统内存（N305 上 OpenVINO 报可用约 28.8 GB），
 7B INT4（~4.5 GB 权重）完全放得下，不需要 offload。
@@ -202,9 +201,13 @@ docker run --rm --device /dev/dri --group-add "$(stat -c %g /dev/dri/renderD128)
 - Intel 驱动库装齐，且 `/etc/OpenCL/vendors/*.icd` 指向的 `libigdrcl.so` 真实存在
   （ICD 指向不存在的库时 `clinfo` 只会静默认不到设备）
 - OpenVINO / openvino-genai 能 import，`CPU` 设备可用
+- 导出工具链（torch / nncf / optimum-cli）在镜像里可用
 - `ci/test_api.py`：造两个假模型目录 + stub 掉 `LLMPipeline`，起真 uvicorn 打真 HTTP，
   验证路由、OpenAPI schema、注册表扫描（跳过 `.tmp` 半成品和没 xml 的目录）、
   运行时切换三种写法、未知模型 404、SSE 分片能拼回完整文本、空 `messages` 报 400
+
+还有一步验证 `AUTO_EXPORT=0` 时模型缺失会拒绝启动并说清原因——
+免得哪天改坏了变成在没人预期的时候闷头下 15 GB。
 
 runner 上没有 iGPU，所以 **GPU 路径和实际 tok/s CI 验不了**，
 要在 N305 上跑 `clinfo -l` 和 `bench.py` 确认。

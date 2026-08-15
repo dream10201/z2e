@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1
 #
-# 两个 target:
-#   runtime — 只有 openvino-genai，日常翻译用，镜像小
-#   export  — 额外装 torch/optimum-intel/nncf，首次把 HF 模型转成 INT4 IR 用
-FROM ubuntu:24.04 AS base
+# 单镜像：Intel iGPU 驱动 + OpenVINO GenAI 运行时 + 模型导出工具链。
+# 早前拆过 runtime/export 两个 target，实测导出依赖只多 ~340 MB（压缩），
+# 换来的却是两个 tag、entrypoint 降级分支和一套 compose 编排，不划算。
+FROM ubuntu:24.04
 
 ARG NEO_VER=26.27.39122.11
 ARG GMM_VER=22.10.0
@@ -36,28 +36,24 @@ ENV VIRTUAL_ENV=/opt/venv
 RUN python3 -m venv $VIRTUAL_ENV
 ENV PATH=$VIRTUAL_ENV/bin:$PATH
 
-ENV HF_HOME=/models/.hf \
-    OV_CACHE=/models/.ovcache \
-    PYTHONUNBUFFERED=1
-WORKDIR /app
-
-
-FROM base AS runtime
+# 运行时依赖和导出依赖分成两层：改代码时前一层能命中缓存
 COPY requirements-runtime.txt /tmp/
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -U pip && pip install -r /tmp/requirements-runtime.txt
-COPY translate.py bench.py server.py modelmgr.py docker-entrypoint.sh /app/
-RUN chmod +x /app/docker-entrypoint.sh
-EXPOSE 8000
-# entrypoint 会先确认 INT4 模型在不在，不在就（在 export 镜像里）自动导出
-ENTRYPOINT ["/app/docker-entrypoint.sh"]
-CMD ["python", "translate.py", "--device", "GPU"]
-
-
-FROM runtime AS export
 COPY requirements-export.txt /tmp/
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r /tmp/requirements-export.txt
-COPY export_int4.sh /app/
-# 只导出、不启服务；想导完接着起服务就把命令附在 docker run 后面
-CMD ["true"]
+
+ENV HF_HOME=/models/.hf \
+    OV_CACHE=/models/.ovcache \
+    MODELS_ROOT=/models \
+    PYTHONUNBUFFERED=1
+WORKDIR /app
+
+COPY translate.py bench.py server.py modelmgr.py export_int4.sh docker-entrypoint.sh /app/
+RUN chmod +x /app/docker-entrypoint.sh /app/export_int4.sh
+EXPOSE 8000
+
+# entrypoint 会先确认模型在不在，不在就自动导出
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+CMD ["python", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]

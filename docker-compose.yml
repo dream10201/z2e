@@ -1,67 +1,51 @@
-x-igpu: &igpu
-  # 把 iGPU 映射进来；RENDER_GID 取宿主机 `stat -c %g /dev/dri/renderD128`
+x-common: &common
+  image: ghcr.io/dream10201/z2e:latest
+  build:
+    context: .
+  # 把 iGPU 映射进来
   devices:
     - /dev/dri:/dev/dri
+  # 容器以 root 跑时不需要这个（root 有 CAP_DAC_OVERRIDE）；
+  # 换成非 root 用户、且宿主机 renderD128 是 0660 时才必需。
+  # RENDER_GID 取宿主机 `stat -c %g /dev/dri/renderD128`
   group_add:
-    - "${RENDER_GID:-993}"
+    - "${RENDER_GID:-0}"
   volumes:
     - ./models:/models
   environment:
     - OV_CACHE=/models/.ovcache
     - HF_HOME=/models/.hf
+    - MODELS_ROOT=/models
     - OV_DEVICE=${OV_DEVICE:-GPU}
     # 换模型改这个就行；目录名自动派生（Qwen/Qwen3-8B -> Qwen3-8B-int4-ov）
     - MODEL_ID=${MODEL_ID:-tencent/Hunyuan-MT-7B}
-    - MODELS_ROOT=/models
     - WEIGHT_FORMAT=${WEIGHT_FORMAT:-int4}
     # 国内下载慢可以设 HF_ENDPOINT=https://hf-mirror.com
     - HF_ENDPOINT=${HF_ENDPOINT:-}
   shm_size: "2gb"
 
-# 一次性：下载 HF 权重并量化成 INT4 IR。模型已存在时秒退，
-# 所以让下面两个服务都 depends_on 它，第一次 up 会自动补上模型。
-x-needs-model: &needs-model
-  depends_on:
-    export:
-      condition: service_completed_successfully
-
 services:
   # OpenAI 兼容 HTTP API，OpenAPI 文档在 /docs
+  # 模型不在会先自动导出，导完自动接着启动
   api:
-    <<: [*igpu, *needs-model]
-    image: ghcr.io/dream10201/z2e:runtime
-    build:
-      context: .
-      target: runtime
-    container_name: hunyuan-mt-api
+    <<: *common
+    container_name: z2e-api
     ports:
       - "${API_PORT:-8000}:8000"
-    command: ["python", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c",
              "import json,urllib.request,sys; s=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health'))['status']; sys.exit(0 if s=='ok' else 1)"]
       interval: 30s
       timeout: 10s
-      # 首次在 GPU 上编译 kernel 要一两分钟，别让健康检查提前判死
-      start_period: 300s
+      # 首次要下模型 + 编译 GPU kernel，别让健康检查提前判死
+      start_period: 3600s
       retries: 3
 
   # 命令行翻译: docker compose run --rm cli
   cli:
-    <<: [*igpu, *needs-model]
-    image: ghcr.io/dream10201/z2e:runtime
-    build:
-      context: .
-      target: runtime
+    <<: *common
+    profiles: ["cli"]
     stdin_open: true
     tty: true
     command: ["python", "translate.py", "--device", "${OV_DEVICE:-GPU}"]
-
-  export:
-    <<: *igpu
-    image: ghcr.io/dream10201/z2e:export
-    build:
-      context: .
-      target: export
-    container_name: hunyuan-mt-export

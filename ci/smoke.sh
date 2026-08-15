@@ -30,6 +30,13 @@ print("devices:", devs)
 assert "CPU" in devs, "CPU 插件没起来"
 PY
 
+echo "--- 导出工具链 ---"
+python - <<'PY'
+import nncf, optimum.intel, torch
+print("torch", torch.__version__, "/ nncf", nncf.__version__, "-> 自动导出可用")
+PY
+command -v optimum-cli >/dev/null && echo "optimum-cli ok"
+
 echo "--- HTTP API（stub 掉模型）---"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd /app 2>/dev/null || cd "$HERE/.."
