@@ -126,7 +126,12 @@ class PipelineManager:
     def __init__(self, device: str, cache: str | None = None):
         self.device = device
         self.cache = cache
+        # lock 保护 pipeline 状态本身（可重入，同线程内 load 嵌套调用没问题）
         self.lock = threading.RLock()
+        # gen_lock 是请求级互斥：调用方从"解析模型"一直持有到"生成结束"，
+        # 否则并发请求指定不同 model 时，会出现用 B 模型生成却按 A 模型上报。
+        # 用普通 Lock 而非 RLock，因为流式响应要在另一个线程里释放它。
+        self.gen_lock = threading.Lock()
         self._pipe: ov_genai.LLMPipeline | None = None
         self._entry: ModelEntry | None = None
         self._load_seconds: float = 0.0
@@ -175,6 +180,16 @@ class ExportJob:
     message: str = ""
     target: str = ""
 
+    @property
+    def log_path(self) -> Path:
+        return MODELS_ROOT / f".export-{Path(self.target).name}.log"
+
+    def tail(self, n: int = 2000) -> str:
+        try:
+            return self.log_path.read_text(errors="replace")[-n:]
+        except Exception:
+            return ""
+
 
 class Exporter:
     """一次跑一个导出任务，状态可查。导出很慢（7B 要 30-60 分钟），
@@ -215,21 +230,24 @@ class Exporter:
         script = "/app/export_int4.sh" if Path("/app/export_int4.sh").is_file() else "export_int4.sh"
         env = {**os.environ, "MODEL_ID": job.model_id, "OUT": job.target}
         try:
-            p = subprocess.run(
-                ["bash", script], env=env,
-                capture_output=True, text=True, timeout=int(os.environ.get("EXPORT_TIMEOUT", "21600")),
-            )
+            # 导出要跑几十分钟，输出直接落盘：容器日志和 GET /admin/pull 都能看到进度，
+            # 不然整段过程是个黑盒
+            MODELS_ROOT.mkdir(parents=True, exist_ok=True)
+            with open(job.log_path, "w") as log:
+                p = subprocess.run(
+                    ["bash", script], env=env, stdout=log, stderr=subprocess.STDOUT,
+                    timeout=int(os.environ.get("EXPORT_TIMEOUT", "21600")),
+                )
             if p.returncode == 0 and is_exported(Path(job.target)):
                 Path(job.target, ".z2e.json").write_text(
                     json.dumps({"model_id": job.model_id, "weight_format": WEIGHT_FORMAT})
                 )
                 job.status = "done"
-                job.message = (p.stdout or "").strip()[-2000:]
             else:
                 job.status = "failed"
-                job.message = ((p.stderr or p.stdout or "").strip())[-2000:] or f"退出码 {p.returncode}"
+            job.message = job.tail()
         except Exception as e:
             job.status = "failed"
-            job.message = str(e)
+            job.message = f"{e}\n{job.tail()}"
         finally:
             job.finished = time.time()

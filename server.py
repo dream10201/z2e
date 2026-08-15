@@ -160,10 +160,10 @@ def _apply_template(messages: list[dict[str, str]]) -> str:
 
 
 def _generate(prompt: str, cfg) -> tuple[str, int, float]:
-    with _mgr.lock:
-        t0 = time.perf_counter()
-        res = _mgr.pipe().generate(prompt, cfg)
-        dt = time.perf_counter() - t0
+    """调用方必须已持有 _mgr.gen_lock。"""
+    t0 = time.perf_counter()
+    res = _mgr.pipe().generate(prompt, cfg)
+    dt = time.perf_counter() - t0
     try:
         n = res.perf_metrics.get_num_generated_tokens()
     except Exception:
@@ -172,7 +172,10 @@ def _generate(prompt: str, cfg) -> tuple[str, int, float]:
 
 
 def _generate_stream(prompt: str, cfg) -> Iterator[str]:
-    """在后台线程跑 generate，把 streamer 回调的分片透过队列吐出来。"""
+    """在后台线程跑 generate，把 streamer 回调的分片透过队列吐出来。
+
+    调用方必须已持有 _mgr.gen_lock（工作线程不再自己去拿，否则跨线程会死锁）。
+    """
     q: queue.Queue[str | None | BaseException] = queue.Queue()
 
     def cb(chunk: str):
@@ -181,8 +184,7 @@ def _generate_stream(prompt: str, cfg) -> Iterator[str]:
 
     def work():
         try:
-            with _mgr.lock:
-                _mgr.pipe().generate(prompt, cfg, cb)
+            _mgr.pipe().generate(prompt, cfg, cb)
         except BaseException as e:  # 把异常带回主线程，别让请求悬住
             q.put(e)
         finally:
@@ -220,7 +222,8 @@ def list_models():
 
 @app.post("/admin/load", tags=["admin"])
 def load_model(req: LoadRequest):
-    entry = _need(req.model)
+    with _mgr.gen_lock:
+        entry = _need(req.model)
     return {"loaded": entry.name, "device": DEVICE, "load_seconds": round(_mgr.load_seconds, 2)}
 
 
@@ -250,16 +253,21 @@ def pull_status():
         "model": job.model_id,
         "target": job.target,
         "elapsed_seconds": round((job.finished or time.time()) - job.started, 1),
-        "message": job.message,
+        # 跑着的时候读日志尾巴，结束了读最终结果
+        "message": job.message or job.tail(),
+        "log": str(job.log_path),
     }
 
 
 @app.post("/translate", response_model=TranslateResponse, tags=["translate"])
 def translate_ep(req: TranslateRequest):
-    entry = _need(req.model)
-    hint = entry.source or entry.name
-    prompt = _apply_template([{"role": "user", "content": build_prompt(req.text, req.to, hint)}])
-    out, n, dt = _generate(prompt, _gen_config(req.max_tokens, 0.0, 1.0, 1.05))
+    # 从解析模型到生成结束整段持锁，避免中途被别的请求换掉模型
+    with _mgr.gen_lock:
+        entry = _need(req.model)
+        hint = entry.source or entry.name
+        prompt = _apply_template(
+            [{"role": "user", "content": build_prompt(req.text, req.to, hint)}])
+        out, n, dt = _generate(prompt, _gen_config(req.max_tokens, 0.0, 1.0, 1.05))
     return TranslateResponse(
         translation=out.strip(),
         model=entry.name,
@@ -274,15 +282,16 @@ def translate_ep(req: TranslateRequest):
 def chat_completions(req: ChatCompletionRequest):
     if not req.messages:
         raise HTTPException(400, "messages 不能为空")
-    entry = _need(req.model)
 
-    prompt = _apply_template([m.model_dump() for m in req.messages])
     cfg = _gen_config(req.max_tokens or 512, req.temperature, req.top_p, req.repetition_penalty)
     cid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
 
     if not req.stream:
-        out, n, _ = _generate(prompt, cfg)
+        with _mgr.gen_lock:
+            entry = _need(req.model)
+            prompt = _apply_template([m.model_dump() for m in req.messages])
+            out, n, _ = _generate(prompt, cfg)
         return {
             "id": cid,
             "object": "chat.completion",
@@ -296,6 +305,16 @@ def chat_completions(req: ChatCompletionRequest):
             "usage": {"prompt_tokens": 0, "completion_tokens": n, "total_tokens": n},
         }
 
+    # 流式：锁在这里拿，一直持有到 SSE 生成器结束才还（可能在另一个线程里还，
+    # 所以 gen_lock 是普通 Lock）
+    _mgr.gen_lock.acquire()
+    try:
+        entry = _need(req.model)
+        prompt = _apply_template([m.model_dump() for m in req.messages])
+    except BaseException:
+        _mgr.gen_lock.release()
+        raise
+
     def sse() -> Iterator[str]:
         def chunk(delta: dict[str, Any], finish: str | None) -> str:
             payload = {
@@ -307,16 +326,20 @@ def chat_completions(req: ChatCompletionRequest):
             }
             return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
-        yield chunk({"role": "assistant", "content": ""}, None)
         try:
-            for piece in _generate_stream(prompt, cfg):
-                yield chunk({"content": piece}, None)
-        except Exception as e:
-            yield f"data: {json.dumps({'error': {'message': str(e)}}, ensure_ascii=False)}\n\n"
+            yield chunk({"role": "assistant", "content": ""}, None)
+            try:
+                for piece in _generate_stream(prompt, cfg):
+                    yield chunk({"content": piece}, None)
+            except Exception as e:
+                yield f"data: {json.dumps({'error': {'message': str(e)}}, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            yield chunk({}, "stop")
             yield "data: [DONE]\n\n"
-            return
-        yield chunk({}, "stop")
-        yield "data: [DONE]\n\n"
+        finally:
+            # 客户端提前断开时 Starlette 会关生成器，这里同样会走到
+            _mgr.gen_lock.release()
 
     return StreamingResponse(
         sse(),

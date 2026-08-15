@@ -62,7 +62,7 @@ GPU 上首次编译 kernel 一两分钟（之后走 `OV_CACHE`，几秒）。所
 ```bash
 curl localhost:8000/admin/pull -H 'Content-Type: application/json' \
      -d '{"model": "Qwen/Qwen3-8B"}'
-curl localhost:8000/admin/pull                     # 轮询进度
+curl localhost:8000/admin/pull                     # 轮询进度，带日志尾巴
 ```
 
 量化参数也是环境变量：`WEIGHT_FORMAT`（int4/int8）、`GROUP_SIZE`、`RATIO`。
@@ -120,8 +120,9 @@ curl localhost:8000/translate -H 'Content-Type: application/json' \
 ```
 
 **并发是串行的**：`LLMPipeline` 不是线程安全的，而且 N305 上并行解码只会互相拖慢，
-所以服务内部加了一把全局锁，请求排队处理（模型切换也用同一把锁）。
-要吞吐就上批处理，别靠并发。
+所以服务内部加了一把全局锁，请求排队处理。锁的范围是**从解析模型一直到生成结束**——
+否则并发请求指定不同 `model` 时，会出现用 B 模型生成却按 A 模型上报的情况
+（`ci/test_concurrency.py` 覆盖了这个）。要吞吐就上批处理，别靠并发。
 
 **翻译模板按模型选**：翻译专用模型自带指定的 prompt 格式，用错了质量会掉。
 `/translate` 按模型名匹配 preset（Hunyuan-MT、Seed-X），认不出就退化成通用指令。
@@ -202,6 +203,8 @@ root 有 `CAP_DAC_OVERRIDE`，直接绕过权限位；另外不少系统上 `ren
   （ICD 指向不存在的库时 `clinfo` 只会静默认不到设备）
 - OpenVINO / openvino-genai 能 import，`CPU` 设备可用
 - 导出工具链（torch / nncf / optimum-cli）在镜像里可用
+- `ci/test_concurrency.py`：16 个并发请求交替指定两个模型，校验每条响应上报的
+  model 和实际生成用的模型一致（去掉锁会立刻失败，反向验证过）
 - `ci/test_api.py`：造两个假模型目录 + stub 掉 `LLMPipeline`，起真 uvicorn 打真 HTTP，
   验证路由、OpenAPI schema、注册表扫描（跳过 `.tmp` 半成品和没 xml 的目录）、
   运行时切换三种写法、未知模型 404、SSE 分片能拼回完整文本、空 `messages` 报 400

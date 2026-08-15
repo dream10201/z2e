@@ -42,4 +42,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 cd /app 2>/dev/null || cd "$HERE/.."
 python "$HERE/test_api.py"
 
+echo "--- 并发一致性 ---"
+python "$HERE/test_concurrency.py"
+
 echo "--- 冒烟通过 ---"
