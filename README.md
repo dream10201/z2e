@@ -132,7 +132,7 @@ delta 整块给出。`tool_choice` 支持 `"auto"`（默认）/ `"none"` / `"req
 指定函数。实现方式是文本层的：函数签名以 Hermes/Qwen 风格注入 system prompt，
 模型输出的 `<tool_call>{...}</tool_call>` 解析回标准格式，历史里的
 `tool_calls` / `tool` 轮按同一格式渲染回去。**前提是模型按这个格式训练过**
-（Qwen、Hermes 系都是）；没练过工具调用的模型（比如 Hunyuan-MT 这种翻译特化模型）
+（Qwen、Hermes 系都是）；没练过工具调用的模型（比如 Hy-MT2 这种翻译特化模型）
 给了 tools 也不会用。
 
 **并发是串行的**：`LLMPipeline` 不是线程安全的，而且 N305 上并行解码只会互相拖慢，

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 把一个 HF decoder-only 因果语言模型导出成 OpenVINO INT4 IR。
-# 产物目录由 MODEL_ID 派生：tencent/Hunyuan-MT-7B -> $MODELS_ROOT/Hunyuan-MT-7B-int4-ov
+# 产物目录由 MODEL_ID 派生：tencent/Hy-MT2-7B -> $MODELS_ROOT/Hy-MT2-7B-int4-ov
 # 一般不用手动调，容器 entrypoint 发现模型缺失会自动跑。
 #
 #   MODEL_ID=Qwen/Qwen3-8B bash export_int4.sh

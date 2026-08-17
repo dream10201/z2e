@@ -23,7 +23,7 @@ FAKE_OUT = "边缘推理降低了时延。"
 
 # 造两个假模型，验证注册表和运行时切换
 ROOT = Path(tempfile.mkdtemp(prefix="z2e-models-"))
-for name, src in [("Hunyuan-MT-7B-int4-ov", "tencent/Hunyuan-MT-7B"),
+for name, src in [("Hy-MT2-7B-int4-ov", "tencent/Hy-MT2-7B"),
                   ("Qwen3-8B-int4-ov", "Qwen/Qwen3-8B")]:
     d = ROOT / name
     d.mkdir()
@@ -35,7 +35,7 @@ for name, src in [("Hunyuan-MT-7B-int4-ov", "tencent/Hunyuan-MT-7B"),
 
 os.environ["MODELS_ROOT"] = str(ROOT)
 os.environ["OV_DEVICE"] = "CPU"
-os.environ.setdefault("MODEL_ID", "tencent/Hunyuan-MT-7B")
+os.environ.setdefault("MODEL_ID", "tencent/Hy-MT2-7B")
 
 
 class _Tok:
@@ -131,14 +131,14 @@ def main():
 
     # 启动时按 MODEL_ID 预热
     st, body = get("/health")
-    assert body["model"] == "Hunyuan-MT-7B-int4-ov", body
-    assert body["available"] == ["Hunyuan-MT-7B-int4-ov", "Qwen3-8B-int4-ov"], body
+    assert body["model"] == "Hy-MT2-7B-int4-ov", body
+    assert body["available"] == ["Hy-MT2-7B-int4-ov", "Qwen3-8B-int4-ov"], body
     print("health ok:", body["model"], body["available"])
 
     # 注册表只列真模型，.tmp 和没 xml 的目录要被跳过
     st, body = get("/v1/models")
     ids = [m["id"] for m in body["data"]]
-    assert ids == ["Hunyuan-MT-7B-int4-ov", "Qwen3-8B-int4-ov"], ids
+    assert ids == ["Hy-MT2-7B-int4-ov", "Qwen3-8B-int4-ov"], ids
     assert body["data"][1]["owned_by"] == "Qwen", body["data"][1]
     print("v1/models ok:", ids)
 
@@ -151,7 +151,7 @@ def main():
 
     # 运行时切换：按目录名、HF repo id、裸名字三种写法都要认
     for ref, want in [("Qwen3-8B-int4-ov", "Qwen3-8B-int4-ov"),
-                      ("tencent/Hunyuan-MT-7B", "Hunyuan-MT-7B-int4-ov"),
+                      ("tencent/Hy-MT2-7B", "Hy-MT2-7B-int4-ov"),
                       ("Qwen3-8B", "Qwen3-8B-int4-ov")]:
         st, body = post("/v1/chat/completions",
                         {"model": ref, "messages": [{"role": "user", "content": "x"}]})
@@ -163,11 +163,11 @@ def main():
     err = expect_error(lambda: post("/v1/chat/completions",
                                     {"model": "不存在的模型",
                                      "messages": [{"role": "user", "content": "x"}]}), 404)
-    assert "Hunyuan-MT-7B-int4-ov" in err["detail"], err
+    assert "Hy-MT2-7B-int4-ov" in err["detail"], err
     print("未知模型 404 ok")
 
-    st, body = post("/admin/load", {"model": "tencent/Hunyuan-MT-7B"})
-    assert body["loaded"] == "Hunyuan-MT-7B-int4-ov", body
+    st, body = post("/admin/load", {"model": "tencent/Hy-MT2-7B"})
+    assert body["loaded"] == "Hy-MT2-7B-int4-ov", body
     print("admin/load ok")
 
     st, body = get("/admin/pull")
@@ -299,7 +299,7 @@ def main():
     os.environ["MODEL_ALLOWLIST"] = "Qwen/Qwen3-8B"
     try:
         expect_error(lambda: post("/v1/chat/completions", {
-            "model": "Hunyuan-MT-7B-int4-ov",
+            "model": "Hy-MT2-7B-int4-ov",
             "messages": [{"role": "user", "content": "x"}]}), 403)
         st, body = post("/v1/chat/completions", {
             "model": "Qwen/Qwen3-8B", "messages": [{"role": "user", "content": "x"}]})

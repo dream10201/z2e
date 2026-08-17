@@ -2,7 +2,7 @@
 """模型注册表 + pipeline 生命周期管理。
 
 约定：每个模型是 $MODELS_ROOT 下的一个目录，里面有 openvino_model.xml。
-目录名由 HF repo id 派生，例如 tencent/Hunyuan-MT-7B -> Hunyuan-MT-7B-int4-ov。
+目录名由 HF repo id 派生，例如 tencent/Hy-MT2-7B -> Hy-MT2-7B-int4-ov。
 
 只支持 decoder-only 因果语言模型（openvino_genai.LLMPipeline 的适用范围）。
 seq2seq 翻译模型（NLLB / M2M100 / Opus-MT 等）走的是另一套 API，这里不支持，
@@ -68,7 +68,7 @@ def serve_allowed(entry: ModelEntry) -> bool:
 
 
 def dir_name_for(model_id: str, weight_format: str = WEIGHT_FORMAT) -> str:
-    """tencent/Hunyuan-MT-7B -> Hunyuan-MT-7B-int4-ov"""
+    """tencent/Hy-MT2-7B -> Hy-MT2-7B-int4-ov"""
     base = model_id.rstrip("/").split("/")[-1]
     base = re.sub(r"[^A-Za-z0-9._-]", "-", base)
     return f"{base}-{weight_format}-ov"
@@ -137,8 +137,8 @@ def scan() -> dict[str, ModelEntry]:
 def resolve(model_ref: str | None) -> ModelEntry | None:
     """把请求里的 model 字段解析成注册表条目。
 
-    接受目录名（Hunyuan-MT-7B-int4-ov）、HF repo id（tencent/Hunyuan-MT-7B）、
-    以及裸名字（Hunyuan-MT-7B）。
+    接受目录名（Hy-MT2-7B-int4-ov）、HF repo id（tencent/Hy-MT2-7B）、
+    以及裸名字（Hy-MT2-7B）。
     """
     if not model_ref:
         return None
