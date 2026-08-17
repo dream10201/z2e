@@ -30,7 +30,7 @@ from typing import Any, Iterator, Literal
 import openvino_genai as ov_genai
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 import modelmgr
 from translate import DEFAULT_MODEL, build_prompt
@@ -67,6 +67,25 @@ app = FastAPI(
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
+
+    @field_validator("role", mode="before")
+    @classmethod
+    def normalize_role(cls, v: Any) -> Any:
+        # tool 结果消息按 user 输入处理，多数 chat template 不认识 tool 角色
+        return "user" if v == "tool" else v
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def flatten_content(cls, v: Any) -> Any:
+        # OpenAI 多模态格式：content 可以是分段数组，取出其中的文本段拼接
+        if isinstance(v, list):
+            return "\n".join(
+                p.get("text", "") for p in v
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        if v is None:
+            return ""
+        return v
 
 
 class ChatCompletionRequest(BaseModel):
