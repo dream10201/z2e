@@ -1,12 +1,9 @@
-# z2e — Zero to Endpoint
+# Zero to Endpoint
 
 一条命令，从零到一个能调的 OpenAI 兼容端点：自动下载模型、量化成 INT4、
 起好 HTTP 服务。基于 OpenVINO GenAI，面向 Intel iGPU / CPU 的边缘小机器
 （主力目标是 i3-N305：8 核 Gracemont + UHD 32EU Xe-LP）。
 默认模型是腾讯 Hunyuan-MT-7B，换 `MODEL_ID` 即可换成任何 decoder-only 模型。
-
-> 名字的由来：z2e 最早是 "zh to en" 的翻译服务，通用化之后翻译功能已经移除，
-> 现在读作 "Zero to Endpoint"。
 
 **支持范围**：`openvino_genai.LLMPipeline` 覆盖的 decoder-only 因果语言模型——
 Qwen / Llama / Mistral / Hunyuan / Seed-X 等。**不支持 seq2seq 翻译模型**
