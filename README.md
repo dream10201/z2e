@@ -13,9 +13,6 @@ Qwen / Llama / Mistral / Hunyuan / Seed-X 等。**不支持 seq2seq 翻译模型
 镜像由 GitHub Actions 构建并推到 `ghcr.io/dream10201/z2e:latest`，
 压缩后约 **0.6 GB**，包含 Intel iGPU 驱动、OpenVINO GenAI 运行时和模型导出工具链。
 
-> 早前拆过 `:runtime` / `:export` 两个 tag，实测导出依赖只多约 340 MB（压缩），
-> 不值得为此多一套概念，已经合并。那两个 tag 仍作为别名指向同一个镜像。
-
 ## 快速开始
 
 ```bash
@@ -29,8 +26,6 @@ echo "RENDER_GID=$(stat -c %g /dev/dri/renderD128)" > .env
 docker compose up -d api
 docker compose logs -f            # 看导出进度
 ```
-
-模型只导一次，之后 `up` 会秒过。国内下载慢就加 `HF_ENDPOINT=https://hf-mirror.com` 到 `.env`。
 
 ## 换模型
 
@@ -227,7 +222,7 @@ root 有 `CAP_DAC_OVERRIDE`，直接绕过权限位；另外不少系统上 `ren
 | `EXPORT_TASK` | `text-generation-with-past` | optimum-cli 的导出 task |
 | `EXPORT_TIMEOUT` | `21600` | `/admin/pull` 后台导出的超时秒数 |
 | `HF_HOME` | `$MODELS_ROOT/.hf` | HF 原始权重缓存目录 |
-| `HF_ENDPOINT` | 空 | 国内下载慢设 `https://hf-mirror.com` |
+| `` | 空 | 国内下载慢设 `https://hf-mirror.com` |
 
 compose 专用：`RENDER_GID`（宿主机 `stat -c %g /dev/dri/renderD128`，见快速开始）、
 `API_PORT`（宿主机端口，默认 8000）。
