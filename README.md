@@ -1,8 +1,12 @@
-# LLM on OpenVINO GenAI (Intel N305 iGPU, INT4)
+# z2e — Zero to Endpoint
 
-在 Intel i3-N305（8 核 Gracemont + UHD 32EU Xe-LP）上用 OpenVINO GenAI 跑
-decoder-only 因果语言模型，权重 INT4，OpenAI 兼容 API，可切 CPU / iGPU 对比。
-默认模型是腾讯 Hunyuan-MT-7B（WMT25 翻译赛道多语向第一），换 `MODEL_ID` 即可换模型。
+一条命令，从零到一个能调的 OpenAI 兼容端点：自动下载模型、量化成 INT4、
+起好 HTTP 服务。基于 OpenVINO GenAI，面向 Intel iGPU / CPU 的边缘小机器
+（主力目标是 i3-N305：8 核 Gracemont + UHD 32EU Xe-LP）。
+默认模型是腾讯 Hunyuan-MT-7B，换 `MODEL_ID` 即可换成任何 decoder-only 模型。
+
+> 名字的由来：z2e 最早是 "zh to en" 的翻译服务，通用化之后翻译功能已经移除，
+> 现在读作 "Zero to Endpoint"。
 
 **支持范围**：`openvino_genai.LLMPipeline` 覆盖的 decoder-only 因果语言模型——
 Qwen / Llama / Mistral / Hunyuan / Seed-X 等。**不支持 seq2seq 翻译模型**
@@ -65,7 +69,7 @@ curl localhost:8000/admin/pull -H 'Content-Type: application/json' \
 curl localhost:8000/admin/pull                     # 轮询进度，带日志尾巴
 ```
 
-量化参数也是环境变量：`WEIGHT_FORMAT`（int4/int8）、`GROUP_SIZE`、`RATIO`。
+量化参数也是环境变量（`WEIGHT_FORMAT` / `GROUP_SIZE` / `RATIO`），完整列表见下面「环境变量」一节。
 
 
 ## HTTP API
@@ -76,6 +80,21 @@ curl localhost:8000/health
 ```
 
 OpenAPI 文档在 http://localhost:8000/docs ，schema 在 `/openapi.json`。
+
+| 端点 | 作用 |
+| --- | --- |
+| `POST /v1/chat/completions` | OpenAI 兼容对话，`stream=true` 走 SSE |
+| `GET /v1/models` | 列出 `/models` 下已导出的模型 |
+| `GET /health` | 当前模型、设备、可用模型列表、加载耗时 |
+| `POST /admin/load` | 显式预热/切换模型 |
+| `POST /admin/pull` | 后台导出一个 HF 模型 |
+| `GET /admin/pull` | 查导出进度（带日志尾巴） |
+
+`/v1/chat/completions` 请求参数：`model`（可空，认目录名 / repo id / 裸名字，
+给了就运行时切换）、`messages`、`max_tokens`（默认 2048，上限 32768）、
+`temperature`（默认 0，走贪心）、`top_p`、`repetition_penalty`（默认 1.05）、`stream`。
+响应里 `finish_reason` 会如实报 `length`（打满 max_tokens）或 `stop`，
+`usage` 带真实的 prompt/completion token 数。
 
 **OpenAI 兼容**，现成的客户端直接指过来就行：
 
@@ -161,6 +180,39 @@ root 有 `CAP_DAC_OVERRIDE`，直接绕过权限位；另外不少系统上 `ren
 `KV_CACHE_PRECISION=u8`（KV cache 压到 u8，省带宽）。32EU 的瓶颈基本在内存带宽，
 这两项影响明显。
 
+## 环境变量
+
+服务运行时：
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `MODEL_ID` | `tencent/Hunyuan-MT-7B` | 启动时加载（缺失则先导出）的 HF repo id |
+| `MODEL_DIR` | 由 `MODEL_ID` 派生 | 直接指定模型目录，优先于 `MODEL_ID` |
+| `MODELS_ROOT` | `/models` | 模型仓库根目录 |
+| `OV_DEVICE` | `GPU` | 推理设备：`GPU` / `CPU` / `AUTO` |
+| `OV_CACHE` | 空（compose 里是 `/models/.ovcache`） | GPU kernel 编译缓存目录，二次启动秒开 |
+| `OV_THREADS` | `4` | CPU 推理线程数（只在 `OV_DEVICE=CPU` 时生效） |
+| `OV_PREFIX_CACHING` | `0` | `1` 开前缀缓存（continuous-batching 后端），agent 长对话 TTFT 明显降；KV cache 常驻内存，紧张的机器可能装不下 |
+| `GEN_WAIT_SECONDS` | `300` | 生成锁排队上限，超时回 503 + `Retry-After` |
+| `ADMIN_TOKEN` | 空（不鉴权） | 设置后 `/admin/*` 需要 `Authorization: Bearer <token>` |
+| `HOST` / `PORT` | `0.0.0.0` / `8000` | 直接 `python server.py` 时的监听地址（compose 里用 `API_PORT` 改宿主机端口） |
+
+导出（entrypoint 自动导出和 `/admin/pull`、手动 `export_int4.sh` 都认）：
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `AUTO_EXPORT` | `1` | 容器启动发现模型缺失时自动导出；设 `0` 则直接拒绝启动 |
+| `WEIGHT_FORMAT` | `int4` | 量化格式：`int4` / `int8` |
+| `GROUP_SIZE` | `128` | INT4 量化分组大小 |
+| `RATIO` | `1.0` | INT4 层占比，`0.8` 表示 20% 层留 INT8 |
+| `EXPORT_TASK` | `text-generation-with-past` | optimum-cli 的导出 task |
+| `EXPORT_TIMEOUT` | `21600` | `/admin/pull` 后台导出的超时秒数 |
+| `HF_HOME` | `$MODELS_ROOT/.hf` | HF 原始权重缓存目录 |
+| `HF_ENDPOINT` | 空 | 国内下载慢设 `https://hf-mirror.com` |
+
+compose 专用：`RENDER_GID`（宿主机 `stat -c %g /dev/dri/renderD128`，见快速开始）、
+`API_PORT`（宿主机端口，默认 8000）。
+
 ## 量化配置
 
 `export_int4.sh` 用 data-free 的 INT4 对称量化，`group_size=128`、`ratio=1.0`：
@@ -175,7 +227,7 @@ root 有 `CAP_DAC_OVERRIDE`，直接绕过权限位；另外不少系统上 `ren
 
 ## CI
 
-`.github/workflows/build.yml` 在 push 到 `main` 或打 `v*` tag 时构建两个 target
+`.github/workflows/build.yml` 在 push 到 `main` 或打 `v*` tag 时构建镜像
 并推到 GHCR，然后跑 `ci/smoke.sh`：
 
 - Intel 驱动库装齐，且 `/etc/OpenCL/vendors/*.icd` 指向的 `libigdrcl.so` 真实存在
@@ -186,7 +238,8 @@ root 有 `CAP_DAC_OVERRIDE`，直接绕过权限位；另外不少系统上 `ren
   model 和实际生成用的模型一致（去掉锁会立刻失败，反向验证过）
 - `ci/test_api.py`：造两个假模型目录 + stub 掉 `LLMPipeline`，起真 uvicorn 打真 HTTP，
   验证路由、OpenAPI schema、注册表扫描（跳过 `.tmp` 半成品和没 xml 的目录）、
-  运行时切换三种写法、未知模型 404、SSE 分片能拼回完整文本、空 `messages` 报 400
+  运行时切换三种写法、未知模型 404、SSE 分片能拼回完整文本、空 `messages` 报 400、
+  Cline 风格入参（content 分段数组、`tool` 角色）能正常收
 
 还有一步验证 `AUTO_EXPORT=0` 时模型缺失会拒绝启动并说清原因——
 免得哪天改坏了变成在没人预期的时候闷头下 15 GB。

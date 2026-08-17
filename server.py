@@ -62,7 +62,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="LLM on OpenVINO",
+    title="z2e — Zero to Endpoint",
     version="2.1.0",
     description="decoder-only 因果语言模型服务，INT4 权重，跑在 Intel iGPU / CPU 上。",
     lifespan=lifespan,
