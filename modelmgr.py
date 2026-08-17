@@ -26,6 +26,45 @@ MODELS_ROOT = Path(os.environ.get("MODELS_ROOT", "/models"))
 WEIGHT_FORMAT = os.environ.get("WEIGHT_FORMAT", "int4")
 DEFAULT_MODEL = os.environ.get("MODEL_DIR") or os.environ.get("MODEL_ID", "tencent/Hunyuan-MT-7B")
 
+# 不设 MODEL_ALLOWLIST 时，允许 API 自动导出的模型：7B 级以下、不用签协议就能下、
+# N305（~16 GB 内存 + 32EU iGPU）上 INT4 跑得动的
+N305_SAFE_MODELS = [
+    "tencent/Hunyuan-MT-7B",
+    "Qwen/Qwen3-0.6B",
+    "Qwen/Qwen3-1.7B",
+    "Qwen/Qwen3-4B",
+    "Qwen/Qwen3-8B",
+    "Qwen/Qwen2.5-7B-Instruct",
+    "Qwen/Qwen2.5-Coder-7B-Instruct",
+    "microsoft/Phi-4-mini-instruct",
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+]
+
+
+def _allowlist() -> list[str] | None:
+    """MODEL_ALLOWLIST 环境变量，逗号分隔；没设返回 None。每次读，测试/热改方便。"""
+    raw = os.environ.get("MODEL_ALLOWLIST", "").strip()
+    if not raw:
+        return None
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
+def pull_allowed(model_id: str) -> bool:
+    """这个模型允许通过 API 触发导出吗？"""
+    al = _allowlist()
+    if al is None:
+        return model_id in N305_SAFE_MODELS or model_id == DEFAULT_MODEL
+    return "*" in al or model_id in al
+
+
+def serve_allowed(entry: ModelEntry) -> bool:
+    """这个已导出的模型允许被切换使用吗？不设 MODEL_ALLOWLIST 就全放行。"""
+    al = _allowlist()
+    if al is None or "*" in al:
+        return True
+    names = set(al) | {dir_name_for(a) for a in al}
+    return entry.name in names or (entry.source in al if entry.source else False)
+
 
 def dir_name_for(model_id: str, weight_format: str = WEIGHT_FORMAT) -> str:
     """tencent/Hunyuan-MT-7B -> Hunyuan-MT-7B-int4-ov"""

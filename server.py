@@ -3,9 +3,10 @@
 
 任何 decoder-only 因果语言模型都能跑（LLMPipeline 的适用范围）。
 请求里的 model 字段可以触发运行时切换——一次只驻留一个模型。
-不做任何 prompt 包装，消息原样过 chat template，怎么用模型由客户端决定。
+消息原样过 chat template，怎么用模型由客户端决定；唯一的例外是 tools——
+函数签名以 Hermes/Qwen 风格注入 system prompt，输出解析回标准 tool_calls。
 
-  POST /v1/chat/completions   OpenAI 兼容，支持 stream=true（SSE）
+  POST /v1/chat/completions   OpenAI 兼容，支持 stream=true（SSE）和 tools
   GET  /v1/models             列出 /models 下已导出的模型
   POST /admin/load            显式预热某个模型
   POST /admin/pull            后台导出一个 HF 模型（需要 :export 镜像）
@@ -16,6 +17,7 @@
 环境变量: MODEL_ID / MODELS_ROOT / OV_DEVICE / OV_CACHE / OV_THREADS / WEIGHT_FORMAT
           OV_PREFIX_CACHING=1 开前缀缓存 / GEN_WAIT_SECONDS 排队上限
           ADMIN_TOKEN 设了之后 /admin/* 要带 Authorization: Bearer <token>
+          MODEL_ALLOWLIST 限制能切/能自动导出的模型（不设=本地随便切+N305 内置清单）
 """
 from __future__ import annotations
 
@@ -23,6 +25,7 @@ import asyncio
 import json
 import os
 import queue
+import re
 import threading
 import time
 import uuid
@@ -72,14 +75,10 @@ app = FastAPI(
 # ---------- 模型定义 ----------
 
 class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: str
-
-    @field_validator("role", mode="before")
-    @classmethod
-    def normalize_role(cls, v: Any) -> Any:
-        # tool 结果消息按 user 输入处理，多数 chat template 不认识 tool 角色
-        return "user" if v == "tool" else v
+    role: Literal["system", "user", "assistant", "tool"]
+    content: str = ""
+    tool_calls: list[dict[str, Any]] | None = None   # assistant 历史里的工具调用
+    tool_call_id: str | None = None                  # tool 消息对应哪次调用
 
     @field_validator("content", mode="before")
     @classmethod
@@ -95,14 +94,40 @@ class ChatMessage(BaseModel):
         return v
 
 
+class ToolFunctionDef(BaseModel):
+    name: str
+    description: str | None = None
+    parameters: dict[str, Any] | None = None
+
+
+class ToolDef(BaseModel):
+    type: str = "function"
+    function: ToolFunctionDef
+
+
+class StreamOptions(BaseModel):
+    include_usage: bool = False
+
+
 class ChatCompletionRequest(BaseModel):
     model: str | None = Field(default=None, description="留空用当前模型；给了就切过去")
     messages: list[ChatMessage]
-    max_tokens: int | None = Field(default=2048, ge=1, le=32768)
+    max_tokens: int | None = Field(default=None, ge=1, le=32768)
+    max_completion_tokens: int | None = Field(
+        default=None, ge=1, le=32768, description="新版字段，优先于 max_tokens")
     temperature: float = Field(default=0.0, ge=0.0, le=2.0, description="0 走贪心")
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
+    stop: str | list[str] | None = Field(default=None, description="停止序列，命中即停且不进输出")
     stream: bool = False
+    stream_options: StreamOptions | None = None
     repetition_penalty: float = 1.05
+    tools: list[ToolDef] | None = None
+    tool_choice: str | dict[str, Any] | None = Field(
+        default=None, description='"auto"（默认）/ "none" / "required" / {"function":{"name":...}}')
+
+    @property
+    def effective_max_tokens(self) -> int:
+        return self.max_completion_tokens or self.max_tokens or 2048
 
 
 class HealthResponse(BaseModel):
@@ -139,16 +164,17 @@ def _acquire_gen_lock() -> None:
 
 
 def _need(model_ref: str | None) -> modelmgr.ModelEntry:
-    """解析并（必要时）切换到目标模型，返回当前条目。"""
+    """解析并（必要时）切换到目标模型，返回当前条目。
+
+    没导出但在允许列表里的模型，自动触发后台导出并回 503 + Retry-After——
+    导出要几十分钟，不能让这个 HTTP 请求挂着等。
+    """
     if model_ref:
         entry = modelmgr.resolve(model_ref)
         if entry is None:
-            avail = sorted(modelmgr.scan())
-            raise HTTPException(
-                404,
-                f"模型 {model_ref!r} 没导出。已有: {avail or '无'}。"
-                f"可以调 POST /admin/pull 后台导出（需要 :export 镜像）",
-            )
+            _auto_pull_or_raise(model_ref)
+        if not modelmgr.serve_allowed(entry):
+            raise HTTPException(403, f"模型 {entry.name!r} 不在 MODEL_ALLOWLIST 里")
         _mgr.load(entry)          # 已经是当前模型时是空操作
         return entry
     if _mgr.current is None:
@@ -156,10 +182,42 @@ def _need(model_ref: str | None) -> modelmgr.ModelEntry:
     return _mgr.current
 
 
-def _gen_config(max_tokens: int, temperature: float, top_p: float, rp: float):
+def _auto_pull_or_raise(model_ref: str) -> None:
+    """请求了一个没导出的模型：能自动导就启动后台导出，不能就说清楚为什么。"""
+    avail = sorted(modelmgr.scan())
+    if not modelmgr.pull_allowed(model_ref):
+        raise HTTPException(
+            404,
+            f"模型 {model_ref!r} 没导出，也不在允许自动导出的列表里。已有: {avail or '无'}。"
+            f"允许列表用 MODEL_ALLOWLIST 配置（逗号分隔，* 放开）",
+        )
+    if not modelmgr.Exporter.available():
+        raise HTTPException(
+            404,
+            f"模型 {model_ref!r} 没导出，且当前镜像没有导出依赖（torch/optimum/nncf）。"
+            f"已有: {avail or '无'}",
+        )
+    try:
+        _exporter.start(model_ref)
+    except RuntimeError as e:
+        raise HTTPException(503, f"导出队列忙：{e}。进度 GET /admin/pull",
+                            headers={"Retry-After": "120"})
+    raise HTTPException(
+        503,
+        f"模型 {model_ref!r} 已开始后台导出（7B 约 30-60 分钟），"
+        f"进度 GET /admin/pull，导完重试本请求即可",
+        headers={"Retry-After": "120"},
+    )
+
+
+def _gen_config(max_tokens: int, temperature: float, top_p: float, rp: float,
+                stop: str | list[str] | None = None):
     cfg = ov_genai.GenerationConfig()
     cfg.max_new_tokens = max_tokens
     cfg.repetition_penalty = rp
+    if stop:
+        cfg.stop_strings = {stop} if isinstance(stop, str) else set(stop)
+        cfg.include_stop_str_in_output = False
     if temperature > 0:
         cfg.do_sample = True
         cfg.temperature = temperature
@@ -167,6 +225,162 @@ def _gen_config(max_tokens: int, temperature: float, top_p: float, rp: float):
     else:
         cfg.do_sample = False
     return cfg
+
+
+# ---------- tools 协议 ----------
+#
+# ov_genai 的 apply_chat_template 不收 tools 参数，所以走文本层：函数签名以
+# Hermes/Qwen 风格注入 system prompt，模型输出里的 <tool_call>{...}</tool_call>
+# 解析回标准 tool_calls。这要求模型本身按这个格式训练过（Qwen / Hermes 系都是）；
+# 没练过工具调用的模型（比如纯翻译模型）给了 tools 也不会用。
+
+_TC_OPEN, _TC_CLOSE = "<tool_call>", "</tool_call>"
+_TC_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+
+
+def _tools_enabled(req: ChatCompletionRequest) -> bool:
+    return bool(req.tools) and req.tool_choice != "none"
+
+
+def _tools_system_text(req: ChatCompletionRequest) -> str:
+    sigs = "\n".join(
+        json.dumps(t.model_dump(exclude_none=True), ensure_ascii=False) for t in req.tools or [])
+    txt = (
+        "# Tools\n\n"
+        "You may call one or more functions to assist with the user query.\n\n"
+        "You are provided with function signatures within <tools></tools> XML tags:\n"
+        f"<tools>\n{sigs}\n</tools>\n\n"
+        "For each function call, return a json object with function name and arguments "
+        "within <tool_call></tool_call> XML tags:\n"
+        '<tool_call>\n{"name": <function-name>, "arguments": <args-json-object>}\n</tool_call>'
+    )
+    if req.tool_choice == "required":
+        txt += "\n\nYou must call at least one function before responding."
+    elif isinstance(req.tool_choice, dict):
+        name = (req.tool_choice.get("function") or {}).get("name")
+        if name:
+            txt += f"\n\nYou must call the function {name!r}."
+    return txt
+
+
+def _make_call(raw: str) -> dict[str, Any] | None:
+    try:
+        d = json.loads(raw)
+        name = d["name"]
+    except Exception:
+        return None
+    args = d.get("arguments", {})
+    if not isinstance(args, str):
+        args = json.dumps(args, ensure_ascii=False)
+    return {"id": f"call_{uuid.uuid4().hex[:12]}", "type": "function",
+            "function": {"name": name, "arguments": args}}
+
+
+def _parse_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
+    """把正文里的 <tool_call> 块摘出来。解析不了的块原样留在正文里。"""
+    calls: list[dict[str, Any]] = []
+
+    def repl(m: re.Match) -> str:
+        c = _make_call(m.group(1))
+        if c is None:
+            return m.group(0)
+        calls.append(c)
+        return ""
+
+    return _TC_RE.sub(repl, text).strip(), calls
+
+
+def _render_messages(req: ChatCompletionRequest) -> list[dict[str, str]]:
+    """OpenAI 消息 -> chat template 能吃的纯文本消息。
+
+    assistant 的 tool_calls 渲染回 <tool_call> 块，tool 结果包成 <tool_response>
+    塞进 user 轮（多数 chat template 不认识 tool 角色），和注入 prompt 的格式对齐，
+    模型看到的多轮工具轨迹才是自洽的。
+    """
+    msgs: list[dict[str, str]] = []
+    for m in req.messages:
+        if m.role == "assistant" and m.tool_calls:
+            blocks = []
+            for c in m.tool_calls:
+                fn = c.get("function", {})
+                args = fn.get("arguments", "{}")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        pass
+                blocks.append(
+                    "<tool_call>\n"
+                    + json.dumps({"name": fn.get("name"), "arguments": args}, ensure_ascii=False)
+                    + "\n</tool_call>")
+            content = "\n".join(([m.content] if m.content else []) + blocks)
+            msgs.append({"role": "assistant", "content": content})
+        elif m.role == "tool":
+            msgs.append({"role": "user",
+                         "content": f"<tool_response>\n{m.content}\n</tool_response>"})
+        else:
+            msgs.append({"role": m.role, "content": m.content})
+    if _tools_enabled(req):
+        sys_txt = _tools_system_text(req)
+        if msgs and msgs[0]["role"] == "system":
+            msgs[0]["content"] += "\n\n" + sys_txt
+        else:
+            msgs.insert(0, {"role": "system", "content": sys_txt})
+    return msgs
+
+
+def _stream_events(pieces: Iterator[str], parse_tools: bool) -> Iterator[tuple[str, Any]]:
+    """把原始分片流变成 ("content", str) 事件流，结尾一条 ("tool_calls", list)。
+
+    开着 tools 时要缓冲可能是 <tool_call> 标签开头的尾巴，避免把半个标签
+    当正文吐给客户端；标签内的内容攒完整了再解析。
+    """
+    if not parse_tools:
+        for p in pieces:
+            yield "content", p
+        yield "tool_calls", []
+        return
+
+    buf, in_call = "", False
+    calls: list[dict[str, Any]] = []
+    for p in pieces:
+        buf += p
+        while True:
+            if in_call:
+                i = buf.find(_TC_CLOSE)
+                if i < 0:
+                    break
+                c = _make_call(buf[:i].strip())
+                if c:
+                    calls.append(c)
+                buf = buf[i + len(_TC_CLOSE):]
+                in_call = False
+            else:
+                i = buf.find(_TC_OPEN)
+                if i >= 0:
+                    if buf[:i]:
+                        yield "content", buf[:i]
+                    buf = buf[i + len(_TC_OPEN):]
+                    in_call = True
+                    continue
+                # 留下可能是标签前缀的尾巴，其余的放行
+                keep = 0
+                for k in range(min(len(buf), len(_TC_OPEN) - 1), 0, -1):
+                    if buf.endswith(_TC_OPEN[:k]):
+                        keep = k
+                        break
+                if keep < len(buf):
+                    yield "content", buf[:len(buf) - keep]
+                buf = buf[len(buf) - keep:]
+                break
+    if in_call:
+        # 没闭合就到头了（多半是打满 max_tokens），能解析就收下
+        c = _make_call(buf.strip())
+        if c:
+            calls.append(c)
+    elif buf:
+        yield "content", buf
+    yield "tool_calls", calls
 
 
 def _apply_template(messages: list[dict[str, str]]) -> str:
@@ -276,6 +490,9 @@ def pull_model(req: PullRequest):
         raise HTTPException(
             501, "当前镜像没有导出依赖（torch/optimum/nncf），用 ghcr.io/dream10201/z2e:export"
         )
+    if not modelmgr.pull_allowed(req.model):
+        raise HTTPException(
+            403, f"模型 {req.model!r} 不在允许导出的列表里，用 MODEL_ALLOWLIST 配置")
     if modelmgr.resolve(req.model) is not None:
         return {"status": "done", "message": "已经导出过了"}
     try:
@@ -307,8 +524,8 @@ def chat_completions(req: ChatCompletionRequest):
     if not req.messages:
         raise HTTPException(400, "messages 不能为空")
 
-    max_tokens = req.max_tokens or 2048
-    cfg = _gen_config(max_tokens, req.temperature, req.top_p, req.repetition_penalty)
+    max_tokens = req.effective_max_tokens
+    cfg = _gen_config(max_tokens, req.temperature, req.top_p, req.repetition_penalty, req.stop)
     cid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
 
@@ -316,10 +533,19 @@ def chat_completions(req: ChatCompletionRequest):
         _acquire_gen_lock()
         try:
             entry = _need(req.model)
-            prompt = _apply_template([m.model_dump() for m in req.messages])
+            prompt = _apply_template(_render_messages(req))
             out, n_out, n_in = _generate(prompt, cfg)
         finally:
             _mgr.gen_lock.release()
+        tool_calls: list[dict[str, Any]] = []
+        if _tools_enabled(req):
+            out, tool_calls = _parse_tool_calls(out)
+        message: dict[str, Any] = {"role": "assistant", "content": out}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+            finish = "tool_calls"
+        else:
+            finish = "length" if n_out >= max_tokens else "stop"
         return {
             "id": cid,
             "object": "chat.completion",
@@ -327,8 +553,8 @@ def chat_completions(req: ChatCompletionRequest):
             "model": entry.name,
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": out},
-                "finish_reason": "length" if n_out >= max_tokens else "stop",
+                "message": message,
+                "finish_reason": finish,
             }],
             "usage": {"prompt_tokens": n_in, "completion_tokens": n_out,
                       "total_tokens": n_in + n_out},
@@ -339,35 +565,62 @@ def chat_completions(req: ChatCompletionRequest):
     _acquire_gen_lock()
     try:
         entry = _need(req.model)
-        prompt = _apply_template([m.model_dump() for m in req.messages])
+        prompt = _apply_template(_render_messages(req))
     except BaseException:
         _mgr.gen_lock.release()
         raise
 
+    include_usage = bool(req.stream_options and req.stream_options.include_usage)
+
     def sse() -> Iterator[str]:
         def chunk(delta: dict[str, Any], finish: str | None) -> str:
-            payload = {
+            payload: dict[str, Any] = {
                 "id": cid,
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": entry.name,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
             }
+            if include_usage:
+                # 按 OpenAI 规范：开了 include_usage 后每个 chunk 带 usage: null，
+                # 最后单发一个 choices 为空、usage 有值的 chunk
+                payload["usage"] = None
             return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
         stats: dict[str, int] = {}
         gen = _generate_stream(prompt, cfg, stats)
         try:
             yield chunk({"role": "assistant", "content": ""}, None)
+            tool_calls: list[dict[str, Any]] = []
             try:
-                for piece in gen:
-                    yield chunk({"content": piece}, None)
+                for kind, data in _stream_events(gen, _tools_enabled(req)):
+                    if kind == "content":
+                        yield chunk({"content": data}, None)
+                    else:
+                        tool_calls = data
             except Exception as e:
                 yield f"data: {json.dumps({'error': {'message': str(e)}}, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
                 return
-            finish = "length" if stats.get("tokens", 0) >= max_tokens else "stop"
+            if tool_calls:
+                yield chunk({"tool_calls": [
+                    {"index": i, "id": c["id"], "type": "function", "function": c["function"]}
+                    for i, c in enumerate(tool_calls)
+                ]}, None)
+                finish = "tool_calls"
+            else:
+                finish = "length" if stats.get("tokens", 0) >= max_tokens else "stop"
             yield chunk({}, finish)
+            if include_usage:
+                n_out = stats.get("tokens", 0)
+                n_in = stats.get("prompt_tokens", 0)
+                payload = {
+                    "id": cid, "object": "chat.completion.chunk", "created": created,
+                    "model": entry.name, "choices": [],
+                    "usage": {"prompt_tokens": n_in, "completion_tokens": n_out,
+                              "total_tokens": n_in + n_out},
+                }
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
         finally:
             # 客户端提前断开时 Starlette 会关生成器，这里同样会走到。

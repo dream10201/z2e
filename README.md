@@ -61,13 +61,21 @@ curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
 **一次只驻留一个模型**——N305 上也塞不下两个 7B。切换要卸载旧的再加载新的，
 GPU 上首次编译 kernel 一两分钟（之后走 `OV_CACHE`，几秒）。所以别在生产流量里频繁切。
 
-不想 shell 进容器也能加新模型：
+**请求没导出的模型会自动触发导出**：只要它在允许列表里（见下），服务就启动
+后台导出并回 503 + `Retry-After`，进度看 `GET /admin/pull`，导完重发请求即可。
+也可以显式触发：
 
 ```bash
 curl localhost:8000/admin/pull -H 'Content-Type: application/json' \
      -d '{"model": "Qwen/Qwen3-8B"}'
 curl localhost:8000/admin/pull                     # 轮询进度，带日志尾巴
 ```
+
+**允许列表**：`MODEL_ALLOWLIST` 不设时，本地已导出的模型随便切，但 API 触发
+导出只放行内置的 N305 友好清单（Qwen3 全系、Qwen2.5-7B、Phi-4-mini、
+DeepSeek-R1-Distill-Qwen-7B、Hunyuan-MT-7B 等 7B 级以下开放模型，
+见 `modelmgr.N305_SAFE_MODELS`）。设了就严格按列表来——切换和导出都只认
+列表里的（逗号分隔 repo id，`*` 完全放开）。
 
 量化参数也是环境变量（`WEIGHT_FORMAT` / `GROUP_SIZE` / `RATIO`），完整列表见下面「环境变量」一节。
 
@@ -91,10 +99,14 @@ OpenAPI 文档在 http://localhost:8000/docs ，schema 在 `/openapi.json`。
 | `GET /admin/pull` | 查导出进度（带日志尾巴） |
 
 `/v1/chat/completions` 请求参数：`model`（可空，认目录名 / repo id / 裸名字，
-给了就运行时切换）、`messages`、`max_tokens`（默认 2048，上限 32768）、
-`temperature`（默认 0，走贪心）、`top_p`、`repetition_penalty`（默认 1.05）、`stream`。
-响应里 `finish_reason` 会如实报 `length`（打满 max_tokens）或 `stop`，
-`usage` 带真实的 prompt/completion token 数。
+给了就运行时切换）、`messages`、`max_completion_tokens` / `max_tokens`
+（新旧两个名字都认，前者优先，默认 2048、上限 32768）、`temperature`（默认 0，走贪心）、
+`top_p`、`stop`（停止序列，字符串或数组）、`repetition_penalty`（默认 1.05）、`stream`、
+`stream_options.include_usage`（流式结尾补一个带 usage 的 chunk）、
+`tools` / `tool_choice`（见下）。响应里 `finish_reason` 会如实报
+`length`（打满 max_tokens）/ `stop` / `tool_calls`，`usage` 带真实的
+prompt/completion token 数。`n>1`、`logprobs`、`response_format`、
+`presence/frequency_penalty` 这些不支持，传了会被忽略。
 
 **OpenAI 兼容**，现成的客户端直接指过来就行：
 
@@ -118,9 +130,18 @@ for chunk in r:
     print(chunk.choices[0].delta.content or "", end="")
 ```
 
-`stream=true` 走标准 SSE。服务不做任何 prompt 包装，消息原样过模型自带的
+`stream=true` 走标准 SSE。服务不做 prompt 包装，消息原样过模型自带的
 chat template，怎么用模型由客户端决定。Cline 这类 agent 客户端发的 content
 分段数组和 `tool` 角色也能收（文本段拼接、图片段丢弃——模型不支持视觉）。
+
+**工具调用（tools）**：标准 OpenAI 协议——请求带 `tools` 函数签名，
+响应给 `tool_calls` + `finish_reason: "tool_calls"`，流式下 `tool_calls` 作为
+delta 整块给出。`tool_choice` 支持 `"auto"`（默认）/ `"none"` / `"required"` /
+指定函数。实现方式是文本层的：函数签名以 Hermes/Qwen 风格注入 system prompt，
+模型输出的 `<tool_call>{...}</tool_call>` 解析回标准格式，历史里的
+`tool_calls` / `tool` 轮按同一格式渲染回去。**前提是模型按这个格式训练过**
+（Qwen、Hermes 系都是）；没练过工具调用的模型（比如 Hunyuan-MT 这种翻译特化模型）
+给了 tools 也不会用。
 
 **并发是串行的**：`LLMPipeline` 不是线程安全的，而且 N305 上并行解码只会互相拖慢，
 所以服务内部加了一把全局锁，请求排队处理。锁的范围是**从解析模型一直到生成结束**——
@@ -195,6 +216,7 @@ root 有 `CAP_DAC_OVERRIDE`，直接绕过权限位；另外不少系统上 `ren
 | `OV_PREFIX_CACHING` | `0` | `1` 开前缀缓存（continuous-batching 后端），agent 长对话 TTFT 明显降；KV cache 常驻内存，紧张的机器可能装不下 |
 | `GEN_WAIT_SECONDS` | `300` | 生成锁排队上限，超时回 503 + `Retry-After` |
 | `ADMIN_TOKEN` | 空（不鉴权） | 设置后 `/admin/*` 需要 `Authorization: Bearer <token>` |
+| `MODEL_ALLOWLIST` | 空 | 限制能切换/自动导出的模型，逗号分隔 repo id，`*` 放开；不设时本地模型随便切、自动导出只认内置 N305 清单 |
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | 直接 `python server.py` 时的监听地址（compose 里用 `API_PORT` 改宿主机端口） |
 
 导出（entrypoint 自动导出和 `/admin/pull`、手动 `export_int4.sh` 都认）：
@@ -239,7 +261,10 @@ compose 专用：`RENDER_GID`（宿主机 `stat -c %g /dev/dri/renderD128`，见
 - `ci/test_api.py`：造两个假模型目录 + stub 掉 `LLMPipeline`，起真 uvicorn 打真 HTTP，
   验证路由、OpenAPI schema、注册表扫描（跳过 `.tmp` 半成品和没 xml 的目录）、
   运行时切换三种写法、未知模型 404、SSE 分片能拼回完整文本、空 `messages` 报 400、
-  Cline 风格入参（content 分段数组、`tool` 角色）能正常收
+  Cline 风格入参（content 分段数组、`tool` 角色）能正常收、tools 协议
+  （非流式/流式解析 `<tool_call>`、标签跨分片缓冲、多轮工具轨迹渲染、未调用时正常 stop）、
+  `max_completion_tokens` 优先级、`stop` 两种写法、`stream_options.include_usage`、
+  请求未导出模型自动触发后台导出（503 + Retry-After）、`MODEL_ALLOWLIST` 拦截切换
 
 还有一步验证 `AUTO_EXPORT=0` 时模型缺失会拒绝启动并说清原因——
 免得哪天改坏了变成在没人预期的时候闷头下 15 GB。
