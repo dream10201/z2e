@@ -3,7 +3,7 @@
 一条命令，从零到一个能调的 OpenAI 兼容端点：自动下载模型、量化成 INT4、
 起好 HTTP 服务。基于 OpenVINO GenAI，面向 Intel iGPU / CPU 的边缘小机器
 （主力目标是 i3-N305：8 核 Gracemont + UHD 32EU Xe-LP）。
-默认模型是腾讯 Hunyuan-MT-7B，换 `MODEL_ID` 即可换成任何 decoder-only 模型。
+默认模型是腾讯 Hy-MT2-7B，换 `MODEL_ID` 即可换成任何 decoder-only 模型。
 
 **支持范围**：`openvino_genai.LLMPipeline` 覆盖的 decoder-only 因果语言模型——
 Qwen / Llama / Mistral / Hunyuan / Seed-X 等。**不支持 seq2seq 翻译模型**
@@ -65,7 +65,7 @@ curl localhost:8000/admin/pull                     # 轮询进度，带日志尾
 
 **允许列表**：`MODEL_ALLOWLIST` 不设时，本地已导出的模型随便切，但 API 触发
 导出只放行内置的 N305 友好清单（Qwen3 全系、Qwen2.5-7B、Phi-4-mini、
-DeepSeek-R1-Distill-Qwen-7B、Hunyuan-MT-7B 等 7B 级以下开放模型，
+DeepSeek-R1-Distill-Qwen-7B、Hy-MT2-7B 等 7B 级以下开放模型，
 见 `modelmgr.N305_SAFE_MODELS`）。设了就严格按列表来——切换和导出都只认
 列表里的（逗号分隔 repo id，`*` 完全放开）。
 
@@ -104,7 +104,7 @@ prompt/completion token 数。`n>1`、`logprobs`、`response_format`、
 
 ```bash
 curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "model": "Hunyuan-MT-7B-int4-ov",
+  "model": "Hy-MT2-7B-int4-ov",
   "messages": [{"role": "user", "content": "把下面的文本翻译成中文，不要额外解释。\n\nEdge inference cuts latency."}],
   "stream": false
 }'
@@ -114,7 +114,7 @@ curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '
 from openai import OpenAI
 c = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
 r = c.chat.completions.create(
-    model="Hunyuan-MT-7B-int4-ov",
+    model="Hy-MT2-7B-int4-ov",
     messages=[{"role": "user", "content": "把下面的文本翻译成中文，不要额外解释。\n\nEdge inference cuts latency."}],
     stream=True,
 )
@@ -199,7 +199,7 @@ root 有 `CAP_DAC_OVERRIDE`，直接绕过权限位；另外不少系统上 `ren
 
 | 变量 | 默认 | 作用 |
 | --- | --- | --- |
-| `MODEL_ID` | `tencent/Hunyuan-MT-7B` | 启动时加载（缺失则先导出）的 HF repo id |
+| `MODEL_ID` | `tencent/Hy-MT2-7B` | 启动时加载（缺失则先导出）的 HF repo id |
 | `MODEL_DIR` | 由 `MODEL_ID` 派生 | 直接指定模型目录，优先于 `MODEL_ID` |
 | `MODELS_ROOT` | `/models` | 模型仓库根目录 |
 | `OV_DEVICE` | `GPU` | 推理设备：`GPU` / `CPU` / `AUTO` |

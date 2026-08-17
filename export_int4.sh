@@ -6,7 +6,7 @@
 #   MODEL_ID=Qwen/Qwen3-8B bash export_int4.sh
 set -euo pipefail
 
-MODEL_ID="${MODEL_ID:-tencent/Hunyuan-MT-7B}"
+MODEL_ID="${MODEL_ID:-tencent/Hy-MT2-7B}"
 MODELS_ROOT="${MODELS_ROOT:-/models}"
 WEIGHT_FORMAT="${WEIGHT_FORMAT:-int4}"
 export HF_HOME="${HF_HOME:-$MODELS_ROOT/.hf}"

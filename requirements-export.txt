@@ -4,4 +4,6 @@ torch==2.13.0
 optimum==2.3.0
 optimum-intel[openvino]==2.1.0
 nncf==3.3.0
+# optimum-intel（含 git main）锁 transformers<5.6；Hy-MT2 与初代同架构
+# （hunyuan_v1_dense），5.5.4 实测能加载，模型卡的 >=5.6 只是推荐
 transformers==5.5.4

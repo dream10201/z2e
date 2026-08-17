@@ -24,12 +24,13 @@ import openvino_genai as ov_genai
 
 MODELS_ROOT = Path(os.environ.get("MODELS_ROOT", "/models"))
 WEIGHT_FORMAT = os.environ.get("WEIGHT_FORMAT", "int4")
-DEFAULT_MODEL = os.environ.get("MODEL_DIR") or os.environ.get("MODEL_ID", "tencent/Hunyuan-MT-7B")
+DEFAULT_MODEL = os.environ.get("MODEL_DIR") or os.environ.get("MODEL_ID", "tencent/Hy-MT2-7B")
 
 # 不设 MODEL_ALLOWLIST 时，允许 API 自动导出的模型：7B 级以下、不用签协议就能下、
 # N305（~16 GB 内存 + 32EU iGPU）上 INT4 跑得动的
 N305_SAFE_MODELS = [
-    "tencent/Hunyuan-MT-7B",
+    "tencent/Hy-MT2-7B",
+    "tencent/Hy-MT2-1.8B",
     "Qwen/Qwen3-0.6B",
     "Qwen/Qwen3-1.7B",
     "Qwen/Qwen3-4B",

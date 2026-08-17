@@ -2,7 +2,7 @@
 # 启动前确保模型就位：不在就自动导出。关掉自动导出用 AUTO_EXPORT=0。
 set -euo pipefail
 
-MODEL_ID="${MODEL_ID:-tencent/Hunyuan-MT-7B}"
+MODEL_ID="${MODEL_ID:-tencent/Hy-MT2-7B}"
 MODELS_ROOT="${MODELS_ROOT:-/models}"
 WEIGHT_FORMAT="${WEIGHT_FORMAT:-int4}"
 AUTO_EXPORT="${AUTO_EXPORT:-1}"
