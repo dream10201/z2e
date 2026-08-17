@@ -50,7 +50,7 @@ ENV HF_HOME=/models/.hf \
     PYTHONUNBUFFERED=1
 WORKDIR /app
 
-COPY translate.py bench.py server.py modelmgr.py export_int4.sh docker-entrypoint.sh /app/
+COPY server.py modelmgr.py export_int4.sh docker-entrypoint.sh /app/
 RUN chmod +x /app/docker-entrypoint.sh /app/export_int4.sh
 EXPOSE 8000
 

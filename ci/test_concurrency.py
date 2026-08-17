@@ -63,9 +63,9 @@ class StubPipe:
         return _Res(self.name)
 
 
-import translate  # noqa: E402
+import modelmgr  # noqa: E402
 
-translate.make_pipe = lambda model, device, cache: StubPipe(model)
+modelmgr.make_pipe = lambda model, device, cache: StubPipe(model)
 
 import server  # noqa: E402
 

@@ -67,17 +67,6 @@ curl localhost:8000/admin/pull                     # 轮询进度，带日志尾
 
 量化参数也是环境变量：`WEIGHT_FORMAT`（int4/int8）、`GROUP_SIZE`、`RATIO`。
 
-命令行翻译和跑分：
-
-```bash
-docker compose run --rm cli                              # 交互式，默认译成中文
-echo "Edge inference cuts latency." | \
-  docker compose run --rm -T cli python translate.py --device GPU --to 中文
-docker compose run --rm cli python translate.py --device GPU --to English -f in.txt -o out.txt
-docker compose run --rm cli python bench.py --devices CPU GPU
-```
-
-（`cli` 在 `cli` profile 下，`docker compose up` 不会连带起它。）
 
 ## HTTP API
 
@@ -110,26 +99,23 @@ for chunk in r:
     print(chunk.choices[0].delta.content or "", end="")
 ```
 
-`stream=true` 走标准 SSE。不想自己拼 prompt 的话用更直白的 `/translate`，
-它会套上模型卡给的翻译模板并回报吞吐：
-
-```bash
-curl localhost:8000/translate -H 'Content-Type: application/json' \
-  -d '{"text": "Edge inference cuts latency.", "to": "中文"}'
-# {"translation":"边缘推理降低了时延。","tokens":9,"seconds":3.1,"tokens_per_second":2.9,"device":"GPU"}
-```
+`stream=true` 走标准 SSE。服务不做任何 prompt 包装，消息原样过模型自带的
+chat template，怎么用模型由客户端决定。Cline 这类 agent 客户端发的 content
+分段数组和 `tool` 角色也能收（文本段拼接、图片段丢弃——模型不支持视觉）。
 
 **并发是串行的**：`LLMPipeline` 不是线程安全的，而且 N305 上并行解码只会互相拖慢，
 所以服务内部加了一把全局锁，请求排队处理。锁的范围是**从解析模型一直到生成结束**——
 否则并发请求指定不同 `model` 时，会出现用 B 模型生成却按 A 模型上报的情况
-（`ci/test_concurrency.py` 覆盖了这个）。要吞吐就上批处理，别靠并发。
+（`ci/test_concurrency.py` 覆盖了这个）。排队超过 `GEN_WAIT_SECONDS`（默认 300）
+直接回 503 + `Retry-After`，别让客户端无限悬着。客户端中途断连会立刻叫停生成、
+释放锁。要吞吐就上批处理，别靠并发。
 
-**翻译模板按模型选**：翻译专用模型自带指定的 prompt 格式，用错了质量会掉。
-`/translate` 按模型名匹配 preset（Hunyuan-MT、Seed-X），认不出就退化成通用指令。
-可以用 `TRANSLATE_TEMPLATE` / `TRANSLATE_TEMPLATE_ZH` 覆盖。
-`/v1/chat/completions` 不受影响——它走模型自带的 chat template。
+**前缀缓存**（可选）：agent 类客户端每轮都带完整历史，prompt 前缀递增，
+`OV_PREFIX_CACHING=1` 走 continuous-batching 后端，每轮只 prefill 新增部分，
+长对话 TTFT 明显降。代价是 KV cache 常驻内存，紧张的机器上可能装不下，默认关。
 
-**没有鉴权**，只监听容器内 0.0.0.0。别直接暴露到公网，要么绑
+**鉴权**：`/v1/*` 无鉴权；设了 `ADMIN_TOKEN` 后 `/admin/*` 要带
+`Authorization: Bearer <token>`。别直接暴露到公网，要么绑
 `127.0.0.1:8000:8000`，要么前面挡一层反代。
 
 不用 compose 也是一条命令，entrypoint 会先补上模型再启动服务：
@@ -139,13 +125,6 @@ docker run -d --name z2e --device /dev/dri \
   -p 8000:8000 -v /your/path/models:/models \
   -e MODEL_ID=Qwen/Qwen3-8B \
   ghcr.io/dream10201/z2e
-```
-
-想跑别的命令就附在后面，模型检查照样先做：
-
-```bash
-docker run --rm -it --device /dev/dri -v /your/path/models:/models \
-  ghcr.io/dream10201/z2e python translate.py --device GPU
 ```
 
 已经知道模型在、不想让它自动下载，加 `-e AUTO_EXPORT=0`——这时模型缺失会直接拒绝启动。
@@ -175,7 +154,7 @@ root 有 `CAP_DAC_OVERRIDE`，直接绕过权限位；另外不少系统上 `ren
 **首次在 GPU 上加载要编译 kernel**，慢一两分钟。`OV_CACHE=/models/.ovcache`
 已经在 compose 里配好，第二次启动直接读缓存。
 
-**CPU 侧的线程数**：N305 是 8 个物理核、无超线程。`translate.py` 默认
+**CPU 侧的线程数**：N305 是 8 个物理核、无超线程。默认
 `INFERENCE_NUM_THREADS=4`（用 `OV_THREADS` 覆盖），过度并行在这颗 U 上反而掉速。
 
 **GPU 侧额外开了两项**：`DYNAMIC_QUANTIZATION_GROUP_SIZE=32`（激活动态量化）和
@@ -190,7 +169,7 @@ root 有 `CAP_DAC_OVERRIDE`，直接绕过权限位；另外不少系统上 `ren
 --weight-format int4 --group-size 128 --ratio 1.0 --sym
 ```
 
-译文质量掉得厉害的话，按这个顺序放宽：`--ratio 0.8`（20% 层留 INT8）→
+输出质量掉得厉害的话，按这个顺序放宽：`--ratio 0.8`（20% 层留 INT8）→
 `--group-size 64` → `--weight-format int8`。想再压一点质量损失可以加
 `--awq --dataset wikitext2 --scale-estimation`，但在 N305 上校准要跑很久。
 
@@ -213,4 +192,4 @@ root 有 `CAP_DAC_OVERRIDE`，直接绕过权限位；另外不少系统上 `ren
 免得哪天改坏了变成在没人预期的时候闷头下 15 GB。
 
 runner 上没有 iGPU，所以 **GPU 路径和实际 tok/s CI 验不了**，
-要在 N305 上跑 `clinfo -l` 和 `bench.py` 确认。
+要在 N305 上跑 `clinfo -l` 并实际打一发 `/v1/chat/completions` 确认。

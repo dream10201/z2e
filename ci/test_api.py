@@ -2,7 +2,7 @@
 """不需要真模型的 API 冒烟测试：造两个假模型目录 + stub 掉 LLMPipeline，起真 uvicorn 打真 HTTP。
 
 验证路由、OpenAPI schema、模型注册表扫描、运行时切换、SSE 分片格式这些
-容易写错又不依赖模型权重的部分。真实译文质量和 tok/s 要在有 GPU 的机器上跑 bench.py。
+容易写错又不依赖模型权重的部分。真实生成质量和 tok/s 要在有 GPU 的真机上验。
 """
 import json
 import os
@@ -68,9 +68,9 @@ class StubPipe:
         return _Res(FAKE_OUT)
 
 
-import translate  # noqa: E402
+import modelmgr  # noqa: E402
 
-translate.make_pipe = lambda model, device, cache: StubPipe(model)
+modelmgr.make_pipe = lambda model, device, cache: StubPipe(model)
 
 import server  # noqa: E402
 
@@ -133,8 +133,9 @@ def main():
 
     st, body = get("/openapi.json")
     paths = set(body["paths"])
-    assert {"/health", "/v1/models", "/v1/chat/completions", "/translate",
+    assert {"/health", "/v1/models", "/v1/chat/completions",
             "/admin/load", "/admin/pull"} <= paths, paths
+    assert "/translate" not in paths, paths
     print("openapi ok:", sorted(paths))
 
     # 运行时切换：按目录名、HF repo id、裸名字三种写法都要认
@@ -153,11 +154,6 @@ def main():
                                      "messages": [{"role": "user", "content": "x"}]}), 404)
     assert "Hunyuan-MT-7B-int4-ov" in err["detail"], err
     print("未知模型 404 ok")
-
-    st, body = post("/translate", {"text": "Edge inference cuts latency.", "to": "中文"})
-    assert body["translation"] == FAKE_OUT and body["tokens"] == 7, body
-    assert body["model"] == "Qwen3-8B-int4-ov", body
-    print("translate ok:", body["model"], body["translation"])
 
     st, body = post("/admin/load", {"model": "tencent/Hunyuan-MT-7B"})
     assert body["loaded"] == "Hunyuan-MT-7B-int4-ov", body
@@ -185,6 +181,16 @@ def main():
 
     expect_error(lambda: post("/v1/chat/completions", {"messages": []}), 400)
     print("入参校验 ok")
+
+    # OpenAI 多模态格式的 content 分段数组和 tool 角色都要能收
+    st, body = post("/v1/chat/completions", {"messages": [
+        {"role": "user", "content": [{"type": "text", "text": "分段"},
+                                     {"type": "image_url", "image_url": {"url": "data:x"}}]},
+        {"role": "tool", "content": "工具结果"},
+    ]})
+    assert body["choices"][0]["message"]["content"] == FAKE_OUT, body
+    assert body["choices"][0]["finish_reason"] == "stop", body
+    print("Cline 风格入参 ok")
 
     print("--- API 冒烟通过 ---")
 

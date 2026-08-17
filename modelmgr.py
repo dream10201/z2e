@@ -14,6 +14,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -23,6 +24,7 @@ import openvino_genai as ov_genai
 
 MODELS_ROOT = Path(os.environ.get("MODELS_ROOT", "/models"))
 WEIGHT_FORMAT = os.environ.get("WEIGHT_FORMAT", "int4")
+DEFAULT_MODEL = os.environ.get("MODEL_DIR") or os.environ.get("MODEL_ID", "tencent/Hunyuan-MT-7B")
 
 
 def dir_name_for(model_id: str, weight_format: str = WEIGHT_FORMAT) -> str:
@@ -59,8 +61,18 @@ class ModelEntry:
         }
 
 
+# 每个带 model 字段的请求都会 resolve -> scan，短 TTL 缓存挡掉高频目录遍历，
+# 又不至于让刚导完的模型迟迟不出现
+_SCAN_TTL = 5.0
+_scan_cache: tuple[float, dict[str, ModelEntry]] | None = None
+
+
 def scan() -> dict[str, ModelEntry]:
-    """扫 MODELS_ROOT，返回 {目录名: ModelEntry}。"""
+    """扫 MODELS_ROOT，返回 {目录名: ModelEntry}。结果缓存几秒。"""
+    global _scan_cache
+    now = time.monotonic()
+    if _scan_cache is not None and now - _scan_cache[0] < _SCAN_TTL:
+        return _scan_cache[1]
     out: dict[str, ModelEntry] = {}
     if not MODELS_ROOT.is_dir():
         return out
@@ -78,6 +90,7 @@ def scan() -> dict[str, ModelEntry]:
                 pass
         size = sum(f.stat().st_size for f in p.glob("*.bin"))
         out[p.name] = ModelEntry(name=p.name, path=p, source=source, size_bytes=size)
+    _scan_cache = (now, out)
     return out
 
 
@@ -115,6 +128,38 @@ def resolve(model_ref: str | None) -> ModelEntry | None:
 
 
 # ---------- pipeline 生命周期 ----------
+
+def make_pipe(model: str, device: str, cache: str | None) -> ov_genai.LLMPipeline:
+    cfg: dict[str, object] = {}
+    if cache:
+        Path(cache).mkdir(parents=True, exist_ok=True)
+        cfg["CACHE_DIR"] = cache
+    if device.upper().startswith("CPU"):
+        # N305 是 8 个物理核、无超线程，别超订
+        cfg["INFERENCE_NUM_THREADS"] = int(os.environ.get("OV_THREADS", "4"))
+        cfg["PERFORMANCE_HINT"] = "LATENCY"
+    else:
+        cfg["PERFORMANCE_HINT"] = "LATENCY"
+        # iGPU 上 INT4 权重配合动态量化激活，通常还能再快一档
+        cfg["DYNAMIC_QUANTIZATION_GROUP_SIZE"] = "32"
+        cfg["KV_CACHE_PRECISION"] = "u8"
+
+    t0 = time.perf_counter()
+    pipe: ov_genai.LLMPipeline | None = None
+    # agent 类客户端每轮都带完整历史，prompt 是前缀递增的；前缀缓存能让每轮
+    # 只 prefill 新增部分。走的是 continuous-batching 后端，KV cache 常驻显存，
+    # 在内存紧张的机器上可能装不下，所以默认关，OV_PREFIX_CACHING=1 打开。
+    if os.environ.get("OV_PREFIX_CACHING", "0") == "1":
+        try:
+            sched = ov_genai.SchedulerConfig()
+            sched.enable_prefix_caching = True
+            pipe = ov_genai.LLMPipeline(model, device, scheduler_config=sched, **cfg)
+        except Exception as e:
+            print(f"[load] 前缀缓存后端不可用（{e}），退回普通 pipeline", file=sys.stderr)
+    if pipe is None:
+        pipe = ov_genai.LLMPipeline(model, device, **cfg)
+    print(f"[load] {device} 就绪，耗时 {time.perf_counter() - t0:.1f}s", file=sys.stderr)
+    return pipe
 
 class PipelineManager:
     """一次只驻留一个模型。N305 上也塞不下两个 7B。
@@ -156,8 +201,6 @@ class PipelineManager:
             # 先释放旧的，别让两个模型同时占内存
             self._pipe = None
             self._entry = None
-            from translate import make_pipe  # 复用同一套设备配置
-
             t0 = time.perf_counter()
             self._pipe = make_pipe(str(entry.path), self.device, self.cache)
             self._load_seconds = time.perf_counter() - t0

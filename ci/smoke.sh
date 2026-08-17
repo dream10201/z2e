@@ -2,7 +2,7 @@
 # 镜像冒烟测试。CI runner 上没有 iGPU，所以只验证：
 #   1) Intel 驱动库和 OpenCL ICD 装齐了
 #   2) OpenVINO / openvino-genai 能 import，CPU 设备可用
-# GPU 路径要在真机（N305）上跑 clinfo -l 和 bench.py 确认。
+# GPU 路径要在真机（N305）上跑 clinfo -l 和实际请求确认。
 set -euo pipefail
 
 echo "--- Intel GPU 用户态库 ---"

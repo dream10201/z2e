@@ -41,11 +41,3 @@ services:
       # 首次要下模型 + 编译 GPU kernel，别让健康检查提前判死
       start_period: 3600s
       retries: 3
-
-  # 命令行翻译: docker compose run --rm cli
-  cli:
-    <<: *common
-    profiles: ["cli"]
-    stdin_open: true
-    tty: true
-    command: ["python", "translate.py", "--device", "${OV_DEVICE:-GPU}"]
