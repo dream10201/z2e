@@ -621,7 +621,6 @@ def pull_status():
         "elapsed_seconds": round((job.finished or time.time()) - job.started, 1),
         # 只报结果（失败原因）；进度是运维信息，看容器日志（docker/podman logs）
         "message": job.message,
-        "log": str(job.log_path),
     }
 
 

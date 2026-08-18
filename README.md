@@ -70,8 +70,7 @@ curl localhost:8000/admin/pull                     # 轮询状态：跑没跑完
 ```
 
 轮询接口只报状态和失败原因；导出进度是运维信息，看容器日志
-（`docker/podman logs -f`）。`.export-*.log` 会在 `/models` 卷上落盘一份，
-容器被重建、logs 没了之后验尸用。
+（`docker/podman logs -f`，或宿主机 `journalctl`）。
 
 **允许列表**：`MODEL_ALLOWLIST` 不设时，本地已导出的模型随便切，但 API 触发
 导出只放行内置的 N305 友好清单（Qwen3 全系、Qwen2.5-7B、Phi-4-mini、
