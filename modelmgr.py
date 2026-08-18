@@ -32,14 +32,8 @@ DEFAULT_MODEL = os.environ.get("MODEL_DIR") or os.environ.get("MODEL_ID", "tence
 N305_SAFE_MODELS = [
     "tencent/Hy-MT2-7B",
     "tencent/Hy-MT2-1.8B",
-    "Qwen/Qwen3-0.6B",
-    "Qwen/Qwen3-1.7B",
+    "openbmb/MiniCPM5-1B",
     "Qwen/Qwen3-4B",
-    "Qwen/Qwen3-8B",
-    "Qwen/Qwen2.5-7B-Instruct",
-    "Qwen/Qwen2.5-Coder-7B-Instruct",
-    "microsoft/Phi-4-mini-instruct",
-    "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
 ]
 
 
