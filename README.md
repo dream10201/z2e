@@ -69,6 +69,9 @@ curl localhost:8000/admin/pull -H 'Content-Type: application/json' \
 curl localhost:8000/admin/pull                     # 轮询进度，带日志尾巴
 ```
 
+后台导出的输出同时透传到容器 stdout，`docker/podman logs -f` 也能直接看进度
+（落盘的 `.export-*.log` 只是给 `GET /admin/pull` 读尾巴用的副本）。
+
 **允许列表**：`MODEL_ALLOWLIST` 不设时，本地已导出的模型随便切，但 API 触发
 导出只放行内置的 N305 友好清单（Qwen3 全系、Qwen2.5-7B、Phi-4-mini、
 DeepSeek-R1-Distill-Qwen-7B、Hy-MT2-7B 等 7B 级以下开放模型，

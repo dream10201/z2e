@@ -336,23 +336,37 @@ class Exporter:
         job.status = "running"
         script = "/app/export_int4.sh" if Path("/app/export_int4.sh").is_file() else "export_int4.sh"
         env = {**os.environ, "MODEL_ID": job.model_id, "OUT": job.target}
+        timeout = int(os.environ.get("EXPORT_TIMEOUT", "21600"))
+        killed = threading.Event()
         try:
-            # 导出要跑几十分钟，输出直接落盘：容器日志和 GET /admin/pull 都能看到进度，
-            # 不然整段过程是个黑盒
+            # 导出要跑几十分钟，输出双写：落盘给 GET /admin/pull 读尾巴，
+            # 同时透传到本进程 stdout——docker/podman logs 里直接能看进度。
+            # 按块转发而不是按行：HF 下载进度条用 \r 刷新，按行读会攒很久才吐
             MODELS_ROOT.mkdir(parents=True, exist_ok=True)
-            with open(job.log_path, "w") as log:
-                p = subprocess.run(
-                    ["bash", script], env=env, stdout=log, stderr=subprocess.STDOUT,
-                    timeout=int(os.environ.get("EXPORT_TIMEOUT", "21600")),
+            with open(job.log_path, "wb") as log:
+                p = subprocess.Popen(
+                    ["bash", script], env=env,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 )
-            if p.returncode == 0 and is_exported(Path(job.target)):
+                timer = threading.Timer(timeout, lambda: (killed.set(), p.kill()))
+                timer.start()
+                try:
+                    while chunk := p.stdout.read1(65536):
+                        log.write(chunk)
+                        log.flush()
+                        sys.stdout.buffer.write(chunk)
+                        sys.stdout.flush()
+                    rc = p.wait()
+                finally:
+                    timer.cancel()
+            if rc == 0 and is_exported(Path(job.target)):
                 Path(job.target, ".z2e.json").write_text(
                     json.dumps({"model_id": job.model_id, "weight_format": WEIGHT_FORMAT})
                 )
                 job.status = "done"
             else:
                 job.status = "failed"
-            job.message = job.tail()
+            job.message = (f"导出超过 {timeout}s 被终止\n" if killed.is_set() else "") + job.tail()
         except Exception as e:
             job.status = "failed"
             job.message = f"{e}\n{job.tail()}"
