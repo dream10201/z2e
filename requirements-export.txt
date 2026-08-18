@@ -4,9 +4,8 @@ torch==2.13.0
 optimum==2.3.0
 optimum-intel[openvino]==2.1.0
 nncf==3.3.0
-# 这个钉版是被 optimum-intel 的 Qwen3.5 支持逼死的：它的导出配置显式声明
-# MIN/MAX_TRANSFORMERS_VERSION = 5.2.0 / 5.2.99（依赖只存在于 5.2.x 的
-# Qwen3_5DynamicCache，5.5.0 起被移除，见 optimum-intel#1786），而 5.2.x 只发过
-# 5.2.0，所以只能是它。hunyuan（Hy-MT2）等其它架构在 5.2.0 下没有反向限制；
-# 之前实测过的是 5.5.4，5.2.0 待真机回归确认
-transformers==5.2.0
+# optimum-intel（含 git main）锁 transformers<5.6，5.5.4 是约束内最新，
+# Hy-MT2（hunyuan_v1_dense）实测能加载。注意：Qwen3.5 系导出用不了这个版本——
+# optimum-intel 的导出配置把它硬锁在 transformers==5.2.0（见 optimum-intel#1786），
+# 真要导 Qwen3.5 就临时降到 5.2.0
+transformers==5.5.4
