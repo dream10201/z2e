@@ -51,6 +51,24 @@ if [ ! -f "$TMP/openvino_model.xml" ] && [ ! -f "$TMP/openvino_language_model.xm
   echo "[export] 产物里既没有 openvino_model.xml 也没有 openvino_language_model.xml" >&2
   exit 1
 fi
+
+# optimum-cli 导 VLM 时可能漏拷图像预处理配置（optimum-intel#1786 提到过），
+# VLMPipeline 加载要用；缺了就从 HF 仓库补一份，补不到也不挡导出
+if [ -f "$TMP/openvino_language_model.xml" ]; then
+  MODEL_ID="$MODEL_ID" TMP="$TMP" python - <<'PY' || echo "[export] 预处理配置补拷失败（不致命）" >&2
+import os, shutil
+from huggingface_hub import hf_hub_download
+for name in ("preprocessor_config.json", "processor_config.json", "chat_template.json"):
+    dst = os.path.join(os.environ["TMP"], name)
+    if os.path.exists(dst):
+        continue
+    try:
+        shutil.copy(hf_hub_download(os.environ["MODEL_ID"], name), dst)
+        print(f"[export] 补拷 {name}")
+    except Exception:
+        pass
+PY
+fi
 printf '{"model_id": "%s", "weight_format": "%s"}\n' "$MODEL_ID" "$WEIGHT_FORMAT" > "$TMP/.z2e.json"
 mv "$TMP" "$OUT"
 
