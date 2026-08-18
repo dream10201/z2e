@@ -158,7 +158,7 @@ delta 整块给出。`tool_choice` 支持 `"auto"`（默认）/ `"none"` / `"req
 （Qwen、Hermes 系都是）；没练过工具调用的模型（比如 Hy-MT2 这种翻译特化模型）
 给了 tools 也不会用。
 
-**并发是串行的**：`LLMPipeline` 不是线程安全的，而且 N305 上并行解码只会互相拖慢，
+**并发是串行的**：GenAI 的 pipeline 都不是线程安全的，而且 N305 上并行解码只会互相拖慢，
 所以服务内部加了一把全局锁，请求排队处理。锁的范围是**从解析模型一直到生成结束**——
 否则并发请求指定不同 `model` 时，会出现用 B 模型生成却按 A 模型上报的情况
 （`ci/test_concurrency.py` 覆盖了这个）。排队超过 `GEN_WAIT_SECONDS`（默认 300）
@@ -275,10 +275,12 @@ compose 专用：`RENDER_GID`（宿主机 `stat -c %g /dev/dri/renderD128`，见
 - 导出工具链（torch / nncf / optimum-cli）在镜像里可用
 - `ci/test_concurrency.py`：16 个并发请求交替指定两个模型，校验每条响应上报的
   model 和实际生成用的模型一致（去掉锁会立刻失败，反向验证过）
-- `ci/test_api.py`：造两个假模型目录 + stub 掉 `LLMPipeline`，起真 uvicorn 打真 HTTP，
-  验证路由、OpenAPI schema、注册表扫描（跳过 `.tmp` 半成品和没 xml 的目录）、
-  运行时切换三种写法、未知模型 404、SSE 分片能拼回完整文本、空 `messages` 报 400、
-  Cline 风格入参（content 分段数组、`tool` 角色）能正常收、tools 协议
+- `ci/test_api.py`：造三个假模型目录（含一个 VLM 布局的）+ stub 掉 pipeline，
+  起真 uvicorn 打真 HTTP，验证路由、OpenAPI schema、注册表扫描（跳过 `.tmp`
+  半成品和没 xml 的目录）、运行时切换三种写法、未知模型 404、SSE 分片能拼回完整文本、
+  空 `messages` 报 400、Cline 风格入参（content 分段数组、`tool` 角色）能正常收、
+  VLM 图片链路（`image_url` 解码、`<ov_genai_image_i>` 标签注入、解码失败 400、
+  `/health` 的 `multimodal` 上报）、tools 协议
   （非流式/流式解析 `<tool_call>`、标签跨分片缓冲、多轮工具轨迹渲染、未调用时正常 stop）、
   `max_completion_tokens` 优先级、`stop` 两种写法、`stream_options.include_usage`、
   请求未导出模型自动触发后台导出（503 + Retry-After）、`MODEL_ALLOWLIST` 拦截切换

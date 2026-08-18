@@ -1,5 +1,6 @@
 #!/usr/bin/env python
-"""不需要真模型的 API 冒烟测试：造两个假模型目录 + stub 掉 LLMPipeline，起真 uvicorn 打真 HTTP。
+"""不需要真模型的 API 冒烟测试：造三个假模型目录（含一个 VLM 布局的）+ stub 掉
+pipeline，起真 uvicorn 打真 HTTP。
 
 验证路由、OpenAPI schema、模型注册表扫描、运行时切换、SSE 分片格式这些
 容易写错又不依赖模型权重的部分。真实生成质量和 tok/s 要在有 GPU 的真机上验。

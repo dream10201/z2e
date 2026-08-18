@@ -220,7 +220,7 @@ def make_pipe(
 class PipelineManager:
     """一次只驻留一个模型。N305 上也塞不下两个 7B。
 
-    generate 和切换共用一把锁：LLMPipeline 不是线程安全的，而且这颗 U 上
+    generate 和切换共用一把锁：GenAI 的 pipeline 都不是线程安全的，而且这颗 U 上
     并发解码只会互相拖慢。
     """
 
