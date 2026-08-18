@@ -619,8 +619,8 @@ def pull_status():
         "model": job.model_id,
         "target": job.target,
         "elapsed_seconds": round((job.finished or time.time()) - job.started, 1),
-        # 跑着的时候读日志尾巴，结束了读最终结果
-        "message": job.message or job.tail(),
+        # 只报结果（失败原因）；进度是运维信息，看容器日志（docker/podman logs）
+        "message": job.message,
         "log": str(job.log_path),
     }
 

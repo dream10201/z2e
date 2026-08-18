@@ -291,12 +291,6 @@ class ExportJob:
     def log_path(self) -> Path:
         return MODELS_ROOT / f".export-{Path(self.target).name}.log"
 
-    def tail(self, n: int = 2000) -> str:
-        try:
-            return self.log_path.read_text(errors="replace")[-n:]
-        except Exception:
-            return ""
-
 
 class Exporter:
     """一次跑一个导出任务，状态可查。导出很慢（7B 要 30-60 分钟），
@@ -339,9 +333,10 @@ class Exporter:
         timeout = int(os.environ.get("EXPORT_TIMEOUT", "21600"))
         killed = threading.Event()
         try:
-            # 导出要跑几十分钟，输出双写：落盘给 GET /admin/pull 读尾巴，
-            # 同时透传到本进程 stdout——docker/podman logs 里直接能看进度。
-            # 按块转发而不是按行：HF 下载进度条用 \r 刷新，按行读会攒很久才吐
+            # 导出要跑几十分钟，进度看容器日志：输出透传到本进程 stdout，
+            # docker/podman logs 直接能看。同时落盘一份——容器被重建后日志就没了，
+            # 这份留给事后验尸。按块转发而不是按行：HF 下载进度条用 \r 刷新，
+            # 按行读会攒很久才吐
             MODELS_ROOT.mkdir(parents=True, exist_ok=True)
             with open(job.log_path, "wb") as log:
                 p = subprocess.Popen(
@@ -364,11 +359,14 @@ class Exporter:
                     json.dumps({"model_id": job.model_id, "weight_format": WEIGHT_FORMAT})
                 )
                 job.status = "done"
+            elif killed.is_set():
+                job.status = "failed"
+                job.message = f"导出超过 {timeout}s 被终止，日志看容器输出或 {job.log_path}"
             else:
                 job.status = "failed"
-            job.message = (f"导出超过 {timeout}s 被终止\n" if killed.is_set() else "") + job.tail()
+                job.message = f"导出失败（exit {rc}），日志看容器输出或 {job.log_path}"
         except Exception as e:
             job.status = "failed"
-            job.message = f"{e}\n{job.tail()}"
+            job.message = str(e)
         finally:
             job.finished = time.time()

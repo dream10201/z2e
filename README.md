@@ -66,11 +66,12 @@ GPU 上首次编译 kernel 一两分钟（之后走 `OV_CACHE`，几秒）。所
 ```bash
 curl localhost:8000/admin/pull -H 'Content-Type: application/json' \
      -d '{"model": "Qwen/Qwen3-8B"}'
-curl localhost:8000/admin/pull                     # 轮询进度，带日志尾巴
+curl localhost:8000/admin/pull                     # 轮询状态：跑没跑完、成没成
 ```
 
-后台导出的输出同时透传到容器 stdout，`docker/podman logs -f` 也能直接看进度
-（落盘的 `.export-*.log` 只是给 `GET /admin/pull` 读尾巴用的副本）。
+轮询接口只报状态和失败原因；导出进度是运维信息，看容器日志
+（`docker/podman logs -f`）。`.export-*.log` 会在 `/models` 卷上落盘一份，
+容器被重建、logs 没了之后验尸用。
 
 **允许列表**：`MODEL_ALLOWLIST` 不设时，本地已导出的模型随便切，但 API 触发
 导出只放行内置的 N305 友好清单（Qwen3 全系、Qwen2.5-7B、Phi-4-mini、
@@ -97,7 +98,7 @@ OpenAPI 文档在 http://localhost:8000/docs ，schema 在 `/openapi.json`。
 | `GET /health` | 当前模型、设备、可用模型列表、加载耗时 |
 | `POST /admin/load` | 显式预热/切换模型 |
 | `POST /admin/pull` | 后台导出一个 HF 模型 |
-| `GET /admin/pull` | 查导出进度（带日志尾巴） |
+| `GET /admin/pull` | 查导出状态（进度看容器日志） |
 
 `/v1/chat/completions` 请求参数：`model`（可空，认目录名 / repo id / 裸名字，
 给了就运行时切换）、`messages`、`max_completion_tokens` / `max_tokens`
