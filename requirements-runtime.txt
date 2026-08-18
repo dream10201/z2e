@@ -3,3 +3,5 @@ openvino-genai==2026.3.0.0
 openvino-tokenizers==2026.3.0.0
 fastapi==0.141.1
 uvicorn[standard]==0.52.3
+# VLM 图片输入解码用
+pillow==12.3.0

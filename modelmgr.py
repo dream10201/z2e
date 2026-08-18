@@ -1,10 +1,11 @@
 #!/usr/bin/env python
 """模型注册表 + pipeline 生命周期管理。
 
-约定：每个模型是 $MODELS_ROOT 下的一个目录，里面有 openvino_model.xml。
+约定：每个模型是 $MODELS_ROOT 下的一个目录，里面有 openvino_model.xml
+（decoder-only，LLMPipeline）或 openvino_language_model.xml（多模态 VLM，
+VLMPipeline，例如 qwen3_5 / qwen3_vl 这类只能按 image-text-to-text 导出的架构）。
 目录名由 HF repo id 派生，例如 tencent/Hy-MT2-7B -> Hy-MT2-7B-int4-ov。
 
-只支持 decoder-only 因果语言模型（openvino_genai.LLMPipeline 的适用范围）。
 seq2seq 翻译模型（NLLB / M2M100 / Opus-MT 等）走的是另一套 API，这里不支持，
 导出阶段会直接报错。
 """
@@ -82,7 +83,15 @@ def dir_for(model_id: str, weight_format: str = WEIGHT_FORMAT) -> Path:
 
 
 def is_exported(path: Path) -> bool:
-    return (path / "openvino_model.xml").is_file()
+    return (path / "openvino_model.xml").is_file() or is_vlm(path)
+
+
+def is_vlm(path: Path) -> bool:
+    """多模态导出产物：语言塔叫 openvino_language_model.xml，没有 openvino_model.xml。"""
+    return (
+        not (path / "openvino_model.xml").is_file()
+        and (path / "openvino_language_model.xml").is_file()
+    )
 
 
 @dataclass
@@ -169,7 +178,9 @@ def resolve(model_ref: str | None) -> ModelEntry | None:
 
 # ---------- pipeline 生命周期 ----------
 
-def make_pipe(model: str, device: str, cache: str | None) -> ov_genai.LLMPipeline:
+def make_pipe(
+    model: str, device: str, cache: str | None
+) -> ov_genai.LLMPipeline | ov_genai.VLMPipeline:
     cfg: dict[str, object] = {}
     if cache:
         Path(cache).mkdir(parents=True, exist_ok=True)
@@ -185,6 +196,11 @@ def make_pipe(model: str, device: str, cache: str | None) -> ov_genai.LLMPipelin
         cfg["KV_CACHE_PRECISION"] = "u8"
 
     t0 = time.perf_counter()
+    if is_vlm(Path(model)):
+        # 多模态产物用 VLMPipeline；纯文本对话它也能跑，图片是可选输入
+        pipe = ov_genai.VLMPipeline(model, device, **cfg)
+        print(f"[load] VLM {device} 就绪，耗时 {time.perf_counter() - t0:.1f}s", file=sys.stderr)
+        return pipe
     pipe: ov_genai.LLMPipeline | None = None
     # agent 类客户端每轮都带完整历史，prompt 是前缀递增的；前缀缓存能让每轮
     # 只 prefill 新增部分。走的是 continuous-batching 后端，KV cache 常驻显存，
@@ -217,8 +233,9 @@ class PipelineManager:
         # 否则并发请求指定不同 model 时，会出现用 B 模型生成却按 A 模型上报。
         # 用普通 Lock 而非 RLock，因为流式响应要在另一个线程里释放它。
         self.gen_lock = threading.Lock()
-        self._pipe: ov_genai.LLMPipeline | None = None
+        self._pipe: ov_genai.LLMPipeline | ov_genai.VLMPipeline | None = None
         self._entry: ModelEntry | None = None
+        self._is_vlm = False
         self._load_seconds: float = 0.0
 
     @property
@@ -229,7 +246,12 @@ class PipelineManager:
     def load_seconds(self) -> float:
         return self._load_seconds
 
-    def pipe(self) -> ov_genai.LLMPipeline:
+    @property
+    def is_vlm(self) -> bool:
+        """当前加载的模型是不是多模态（能吃图片输入）。"""
+        return self._is_vlm
+
+    def pipe(self) -> ov_genai.LLMPipeline | ov_genai.VLMPipeline:
         if self._pipe is None:
             raise RuntimeError("还没有加载模型")
         return self._pipe
@@ -245,11 +267,13 @@ class PipelineManager:
             self._pipe = make_pipe(str(entry.path), self.device, self.cache)
             self._load_seconds = time.perf_counter() - t0
             self._entry = entry
+            self._is_vlm = is_vlm(entry.path)
 
     def unload(self) -> None:
         with self.lock:
             self._pipe = None
             self._entry = None
+            self._is_vlm = False
 
 
 # ---------- 后台导出 ----------

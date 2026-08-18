@@ -15,7 +15,7 @@ if [ -z "${MODEL_DIR:-}" ]; then
 fi
 export MODEL_DIR
 
-if [ ! -f "$MODEL_DIR/openvino_model.xml" ]; then
+if [ ! -f "$MODEL_DIR/openvino_model.xml" ] && [ ! -f "$MODEL_DIR/openvino_language_model.xml" ]; then
   if [ "$AUTO_EXPORT" != "1" ]; then
     cat >&2 <<EOF
 [entrypoint] 找不到模型: $MODEL_DIR  (MODEL_ID=$MODEL_ID)

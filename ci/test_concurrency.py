@@ -54,11 +54,11 @@ class StubPipe:
     def get_tokenizer(self):
         return _Tok()
 
-    def generate(self, prompt, cfg, cb=None):
+    def generate(self, prompt, generation_config=None, streamer=None):
         time.sleep(0.05)
-        if cb is not None:
+        if streamer is not None:
             for ch in self.name:
-                cb(ch)
+                streamer(ch)
             time.sleep(0.05)
         return _Res(self.name)
 

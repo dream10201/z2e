@@ -30,6 +30,11 @@ for name, src in [("Hy-MT2-7B-int4-ov", "tencent/Hy-MT2-7B"),
     (d / "openvino_model.xml").write_text("<net/>")
     (d / "openvino_model.bin").write_bytes(b"\0" * 16)
     (d / ".z2e.json").write_text(json.dumps({"model_id": src, "weight_format": "int4"}))
+# 假 VLM：多模态导出产物没有 openvino_model.xml，语言塔叫 openvino_language_model.xml
+_vlm = ROOT / "FakeVLM-int4-ov"
+_vlm.mkdir()
+(_vlm / "openvino_language_model.xml").write_text("<net/>")
+(_vlm / ".z2e.json").write_text(json.dumps({"model_id": "fake/FakeVLM", "weight_format": "int4"}))
 (ROOT / "half-baked.tmp").mkdir()          # 半成品目录，不该被列出来
 (ROOT / "not-a-model").mkdir()             # 没有 xml，不该被列出来
 
@@ -67,14 +72,18 @@ class StubPipe:
     def get_tokenizer(self):
         return _Tok()
 
-    def generate(self, prompt, cfg, cb=None):
+    def generate(self, prompt, images=None, generation_config=None, streamer=None):
         text, chunks = FAKE_OUT, (FAKE_OUT[:4], FAKE_OUT[4:])
         if "帮我查天气" in prompt:
             text, chunks = TOOL_TEXT, TOOL_CHUNKS
-        if cb is None:
+        if images:
+            # 回显收到几张图、prompt 里注入了几个通用标签，测试据此断言
+            text = f"images={len(images)} tags={prompt.count('<ov_genai_image_')}"
+            chunks = (text,)
+        if streamer is None:
             return _Res(text)
         for ch in chunks:
-            if cb(ch) == ov_genai.StreamingStatus.STOP:
+            if streamer(ch) == ov_genai.StreamingStatus.STOP:
                 break
         return _Res(text)
 
@@ -132,14 +141,14 @@ def main():
     # 启动时按 MODEL_ID 预热
     st, body = get("/health")
     assert body["model"] == "Hy-MT2-7B-int4-ov", body
-    assert body["available"] == ["Hy-MT2-7B-int4-ov", "Qwen3-8B-int4-ov"], body
+    assert body["available"] == ["FakeVLM-int4-ov", "Hy-MT2-7B-int4-ov", "Qwen3-8B-int4-ov"], body
     print("health ok:", body["model"], body["available"])
 
     # 注册表只列真模型，.tmp 和没 xml 的目录要被跳过
     st, body = get("/v1/models")
     ids = [m["id"] for m in body["data"]]
-    assert ids == ["Hy-MT2-7B-int4-ov", "Qwen3-8B-int4-ov"], ids
-    assert body["data"][1]["owned_by"] == "Qwen", body["data"][1]
+    assert ids == ["FakeVLM-int4-ov", "Hy-MT2-7B-int4-ov", "Qwen3-8B-int4-ov"], ids
+    assert body["data"][2]["owned_by"] == "Qwen", body["data"][2]
     print("v1/models ok:", ids)
 
     st, body = get("/openapi.json")
@@ -201,7 +210,27 @@ def main():
     ]})
     assert body["choices"][0]["message"]["content"] == FAKE_OUT, body
     assert body["choices"][0]["finish_reason"] == "stop", body
-    print("Cline 风格入参 ok")
+    print("Cline 风格入参 ok（文本模型丢弃图片段）")
+
+    # VLM 模型：图片段解码成张量、prompt 里按位置注入 <ov_genai_image_i> 标签
+    png = ("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+           "AAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+    st, body = post("/v1/chat/completions", {"model": "FakeVLM-int4-ov", "messages": [
+        {"role": "user", "content": [{"type": "text", "text": "这是什么"},
+                                     {"type": "image_url", "image_url": {"url": png}}]},
+    ]})
+    assert body["choices"][0]["message"]["content"] == "images=1 tags=1", body
+    st, h = get("/health")
+    assert h["multimodal"] is True, h
+    # 图片解码失败要给 400，不能 500
+    expect_error(lambda: post("/v1/chat/completions", {"model": "FakeVLM-int4-ov", "messages": [
+        {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:x"}}]},
+    ]}), 400)
+    # 切回文本模型，multimodal 要跟着变回去
+    st, body = post("/v1/chat/completions", {
+        "model": "Hy-MT2-7B-int4-ov", "messages": [{"role": "user", "content": "你好"}]})
+    assert get("/health")[1]["multimodal"] is False
+    print("VLM 图片入参 ok（标签注入 / 解码失败 400 / multimodal 上报）")
 
     # tools：非流式，模型输出 <tool_call> 要解析成标准 tool_calls
     tools = [{"type": "function", "function": {

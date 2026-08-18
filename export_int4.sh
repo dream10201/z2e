@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# 把一个 HF decoder-only 因果语言模型导出成 OpenVINO INT4 IR。
+# 把一个 HF 模型导出成 OpenVINO INT4 IR。task 默认 auto，由 optimum 按架构推断：
+# decoder-only 出 openvino_model.xml，多模态（qwen3_5 / qwen3_vl 这类
+# model_type 只注册了 image-text-to-text 的）出 openvino_language_model.xml。
 # 产物目录由 MODEL_ID 派生：tencent/Hy-MT2-7B -> $MODELS_ROOT/Hy-MT2-7B-int4-ov
 # 一般不用手动调，容器 entrypoint 发现模型缺失会自动跑。
 #
@@ -22,7 +24,7 @@ derive_out() {
 }
 OUT="${OUT:-$(derive_out)}"
 
-if [ -f "$OUT/openvino_model.xml" ]; then
+if [ -f "$OUT/openvino_model.xml" ] || [ -f "$OUT/openvino_language_model.xml" ]; then
   echo "[skip] $OUT 已存在"
   exit 0
 fi
@@ -40,12 +42,15 @@ fi
 echo "[export] $MODEL_ID -> $OUT (${QUANT_ARGS[*]})"
 optimum-cli export openvino \
   --model "$MODEL_ID" \
-  --task "${EXPORT_TASK:-text-generation-with-past}" \
+  --task "${EXPORT_TASK:-auto}" \
   "${QUANT_ARGS[@]}" \
   --trust-remote-code \
   "$TMP"
 
-test -f "$TMP/openvino_model.xml" || { echo "[export] 产物缺 openvino_model.xml" >&2; exit 1; }
+if [ ! -f "$TMP/openvino_model.xml" ] && [ ! -f "$TMP/openvino_language_model.xml" ]; then
+  echo "[export] 产物里既没有 openvino_model.xml 也没有 openvino_language_model.xml" >&2
+  exit 1
+fi
 printf '{"model_id": "%s", "weight_format": "%s"}\n' "$MODEL_ID" "$WEIGHT_FORMAT" > "$TMP/.z2e.json"
 mv "$TMP" "$OUT"
 

@@ -1,7 +1,9 @@
 #!/usr/bin/env python
 """OpenVINO GenAI 的 OpenAI 兼容 HTTP 服务。
 
-任何 decoder-only 因果语言模型都能跑（LLMPipeline 的适用范围）。
+decoder-only 因果语言模型（LLMPipeline）和多模态 VLM（VLMPipeline，如
+Qwen-VL / Qwen3.5 系）都能跑。VLM 模型支持 OpenAI 多模态消息格式：content
+分段数组里的 image_url（data: base64 或 http/https）会解码成图片喂给模型。
 请求里的 model 字段可以触发运行时切换——一次只驻留一个模型。
 消息原样过 chat template，怎么用模型由客户端决定；唯一的例外是 tools——
 函数签名以 Hermes/Qwen 风格注入 system prompt，输出解析回标准 tool_calls。
@@ -22,12 +24,15 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 import os
 import queue
 import re
 import threading
 import time
+import urllib.request
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Iterator, Literal
@@ -35,7 +40,7 @@ from typing import Any, Iterator, Literal
 import openvino_genai as ov_genai
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 import modelmgr
 
@@ -74,24 +79,45 @@ app = FastAPI(
 
 # ---------- 模型定义 ----------
 
+# content 分段数组里图片段的占位符，_render_messages 会按全局顺序替换成
+# openvino_genai 认识的 <ov_genai_image_i> 通用标签
+_IMG_MARK = "\x00z2e_image\x00"
+
+
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
     content: str = ""
+    images: list[str] = Field(default_factory=list)  # 本消息里图片段的 url/data URI，按出现顺序
     tool_calls: list[dict[str, Any]] | None = None   # assistant 历史里的工具调用
     tool_call_id: str | None = None                  # tool 消息对应哪次调用
 
+    @model_validator(mode="before")
+    @classmethod
+    def split_content(cls, data: Any) -> Any:
+        # OpenAI 多模态格式：content 可以是分段数组。文本段拼接；图片段收进
+        # images，并在文本里留占位符记住位置
+        if not isinstance(data, dict) or not isinstance(data.get("content"), list):
+            return data
+        texts: list[str] = []
+        images: list[str] = []
+        for p in data["content"]:
+            if not isinstance(p, dict):
+                continue
+            if p.get("type") == "text":
+                texts.append(p.get("text", ""))
+            elif p.get("type") in ("image_url", "input_image"):
+                url = p.get("image_url") or p.get("url") or ""
+                if isinstance(url, dict):
+                    url = url.get("url", "")
+                if url:
+                    texts.append(_IMG_MARK)
+                    images.append(url)
+        return {**data, "content": "\n".join(texts), "images": images}
+
     @field_validator("content", mode="before")
     @classmethod
-    def flatten_content(cls, v: Any) -> Any:
-        # OpenAI 多模态格式：content 可以是分段数组，取出其中的文本段拼接
-        if isinstance(v, list):
-            return "\n".join(
-                p.get("text", "") for p in v
-                if isinstance(p, dict) and p.get("type") == "text"
-            )
-        if v is None:
-            return ""
-        return v
+    def none_to_empty(cls, v: Any) -> Any:
+        return "" if v is None else v
 
 
 class ToolFunctionDef(BaseModel):
@@ -133,6 +159,7 @@ class ChatCompletionRequest(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     model: str | None
+    multimodal: bool = False   # 当前模型是不是 VLM（能吃图片）
     device: str
     models_root: str
     available: list[str]
@@ -213,6 +240,10 @@ def _auto_pull_or_raise(model_ref: str) -> None:
 def _gen_config(max_tokens: int, temperature: float, top_p: float, rp: float,
                 stop: str | list[str] | None = None):
     cfg = ov_genai.GenerationConfig()
+    # prompt 在 _apply_template 里已经过了 chat template，别让 pipeline 再包一层
+    # （新版 GenerationConfig 默认 apply_chat_template=True，VLMPipeline 尤其会踩）
+    if hasattr(cfg, "apply_chat_template"):
+        cfg.apply_chat_template = False
     cfg.max_new_tokens = max_tokens
     cfg.repetition_penalty = rp
     if stop:
@@ -290,15 +321,30 @@ def _parse_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
     return _TC_RE.sub(repl, text).strip(), calls
 
 
-def _render_messages(req: ChatCompletionRequest) -> list[dict[str, str]]:
-    """OpenAI 消息 -> chat template 能吃的纯文本消息。
+def _render_messages(req: ChatCompletionRequest) -> tuple[list[dict[str, str]], list[str]]:
+    """OpenAI 消息 -> (chat template 能吃的纯文本消息, 全部图片 url 按出现顺序)。
+
+    当前模型是 VLM 时，图片占位符替换成 <ov_genai_image_i> 通用标签（i 是整个
+    请求里的全局序号，和返回的 url 列表一一对应），VLMPipeline 生成时会把标签
+    换成对应图片的嵌入。纯文本模型则把图片段丢弃（Cline 这类客户端会给文本模型
+    发截图，硬拒会把它们打断）。
 
     assistant 的 tool_calls 渲染回 <tool_call> 块，tool 结果包成 <tool_response>
     塞进 user 轮（多数 chat template 不认识 tool 角色），和注入 prompt 的格式对齐，
     模型看到的多轮工具轨迹才是自洽的。
     """
+    vlm = _mgr.is_vlm
     msgs: list[dict[str, str]] = []
+    image_urls: list[str] = []
     for m in req.messages:
+        content = m.content
+        if vlm:
+            for url in m.images:
+                content = content.replace(_IMG_MARK, f"<ov_genai_image_{len(image_urls)}>", 1)
+                image_urls.append(url)
+        else:
+            content = content.replace(_IMG_MARK, "")
+        m = m.model_copy(update={"content": content})
         if m.role == "assistant" and m.tool_calls:
             blocks = []
             for c in m.tool_calls:
@@ -326,7 +372,53 @@ def _render_messages(req: ChatCompletionRequest) -> list[dict[str, str]]:
             msgs[0]["content"] += "\n\n" + sys_txt
         else:
             msgs.insert(0, {"role": "system", "content": sys_txt})
-    return msgs
+    return msgs, image_urls
+
+
+# ---------- 图片输入 ----------
+
+IMAGE_MAX_BYTES = int(os.environ.get("IMAGE_MAX_BYTES", str(20 * 1024 * 1024)))
+IMAGE_FETCH_TIMEOUT = float(os.environ.get("IMAGE_FETCH_TIMEOUT", "15"))
+
+
+def _decode_image(url: str):
+    """data: base64 或 http/https 的图片 -> ov.Tensor（HWC uint8 RGB）。
+
+    pillow/numpy 只在真用到图片时才 import：纯文本路径不背这个依赖。
+    """
+    if url.startswith("data:"):
+        try:
+            raw = base64.b64decode(url.split(",", 1)[1], validate=False)
+        except Exception:
+            raise HTTPException(400, "图片 data URI 不是合法的 base64")
+    elif url.startswith(("http://", "https://")):
+        try:
+            r = urllib.request.Request(url, headers={"User-Agent": "z2e"})
+            with urllib.request.urlopen(r, timeout=IMAGE_FETCH_TIMEOUT) as resp:
+                raw = resp.read(IMAGE_MAX_BYTES + 1)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(400, f"图片下载失败 {url!r}: {e}")
+    else:
+        raise HTTPException(400, f"不支持的图片来源 {url[:64]!r}，只认 data: base64 和 http/https")
+    if len(raw) > IMAGE_MAX_BYTES:
+        raise HTTPException(400, f"图片超过 {IMAGE_MAX_BYTES} 字节上限")
+    try:
+        import numpy as np
+        import openvino as ov
+        from PIL import Image
+        pic = Image.open(io.BytesIO(raw)).convert("RGB")
+        return ov.Tensor(np.array(pic))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"图片解码失败: {e}")
+
+
+def _load_images(urls: list[str]) -> list:
+    """_render_messages 只在当前模型是 VLM 时才会收集 url，这里只管解码。"""
+    return [_decode_image(u) for u in urls]
 
 
 def _stream_events(pieces: Iterator[str], parse_tools: bool) -> Iterator[tuple[str, Any]]:
@@ -405,14 +497,23 @@ def _token_counts(res) -> tuple[int, int]:
     return n_out, n_in
 
 
-def _generate(prompt: str, cfg) -> tuple[str, int, int]:
+def _res_text(res) -> str:
+    """DecodedResults / VLMDecodedResults 都有 texts；stub 之类没有的退回 str()。"""
+    texts = getattr(res, "texts", None)
+    return texts[0] if texts else str(res)
+
+
+def _generate(prompt: str, cfg, images: list) -> tuple[str, int, int]:
     """调用方必须已持有 _mgr.gen_lock。返回 (文本, completion_tokens, prompt_tokens)。"""
-    res = _mgr.pipe().generate(prompt, cfg)
+    if images:
+        res = _mgr.pipe().generate(prompt, images=images, generation_config=cfg)
+    else:
+        res = _mgr.pipe().generate(prompt, generation_config=cfg)
     n_out, n_in = _token_counts(res)
-    return str(res), n_out, n_in
+    return _res_text(res), n_out, n_in
 
 
-def _generate_stream(prompt: str, cfg, stats: dict[str, int]) -> Iterator[str]:
+def _generate_stream(prompt: str, cfg, stats: dict[str, int], images: list) -> Iterator[str]:
     """在后台线程跑 generate，把 streamer 回调的分片透过队列吐出来。
 
     调用方必须已持有 _mgr.gen_lock（工作线程不再自己去拿，否则跨线程会死锁）。
@@ -431,7 +532,11 @@ def _generate_stream(prompt: str, cfg, stats: dict[str, int]) -> Iterator[str]:
 
     def work():
         try:
-            res = _mgr.pipe().generate(prompt, cfg, cb)
+            if images:
+                res = _mgr.pipe().generate(
+                    prompt, images=images, generation_config=cfg, streamer=cb)
+            else:
+                res = _mgr.pipe().generate(prompt, generation_config=cfg, streamer=cb)
             stats["tokens"], stats["prompt_tokens"] = _token_counts(res)
         except BaseException as e:  # 把异常带回主线程，别让请求悬住
             q.put(e)
@@ -462,6 +567,7 @@ def health():
     return HealthResponse(
         status="ok" if cur is not None else "no-model",
         model=cur.name if cur else None,
+        multimodal=_mgr.is_vlm,
         device=DEVICE,
         models_root=str(modelmgr.MODELS_ROOT),
         available=sorted(modelmgr.scan()),
@@ -533,8 +639,10 @@ def chat_completions(req: ChatCompletionRequest):
         _acquire_gen_lock()
         try:
             entry = _need(req.model)
-            prompt = _apply_template(_render_messages(req))
-            out, n_out, n_in = _generate(prompt, cfg)
+            msgs, image_urls = _render_messages(req)
+            prompt = _apply_template(msgs)
+            images = _load_images(image_urls)
+            out, n_out, n_in = _generate(prompt, cfg, images)
         finally:
             _mgr.gen_lock.release()
         tool_calls: list[dict[str, Any]] = []
@@ -565,7 +673,9 @@ def chat_completions(req: ChatCompletionRequest):
     _acquire_gen_lock()
     try:
         entry = _need(req.model)
-        prompt = _apply_template(_render_messages(req))
+        msgs, image_urls = _render_messages(req)
+        prompt = _apply_template(msgs)
+        images = _load_images(image_urls)
     except BaseException:
         _mgr.gen_lock.release()
         raise
@@ -588,7 +698,7 @@ def chat_completions(req: ChatCompletionRequest):
             return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
         stats: dict[str, int] = {}
-        gen = _generate_stream(prompt, cfg, stats)
+        gen = _generate_stream(prompt, cfg, stats, images)
         try:
             yield chunk({"role": "assistant", "content": ""}, None)
             tool_calls: list[dict[str, Any]] = []

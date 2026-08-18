@@ -3,12 +3,18 @@
 一条命令，从零到一个能调的 OpenAI 兼容端点：自动下载模型、量化成 INT4、
 起好 HTTP 服务。基于 OpenVINO GenAI，面向 Intel iGPU / CPU 的边缘小机器
 （主力目标是 i3-N305：8 核 Gracemont + UHD 32EU Xe-LP）。
-默认模型是腾讯 Hy-MT2-7B，换 `MODEL_ID` 即可换成任何 decoder-only 模型。
+默认模型是腾讯 Hy-MT2-7B，换 `MODEL_ID` 即可换成任何 decoder-only 或多模态模型。
 
-**支持范围**：`openvino_genai.LLMPipeline` 覆盖的 decoder-only 因果语言模型——
-Qwen / Llama / Mistral / Hunyuan / Seed-X 等。**不支持 seq2seq 翻译模型**
-（NLLB、M2M100、Opus-MT、T5），GenAI 没有对应的 text2text pipeline，
-这类模型在导出阶段就会失败。
+**支持范围**：
+- decoder-only 因果语言模型（`openvino_genai.LLMPipeline`）——Qwen / Llama /
+  Mistral / Hunyuan / Seed-X 等；
+- 多模态 VLM（`openvino_genai.VLMPipeline`）——Qwen-VL / Qwen3.5 这类
+  `model_type` 只能按 image-text-to-text 导出的架构。既能当纯文本模型聊，
+  也支持 OpenAI 多模态消息格式发图（见「HTTP API」）。导出 task 由 optimum
+  自动按架构推断（`EXPORT_TASK=auto`）。
+
+**不支持 seq2seq 翻译模型**（NLLB、M2M100、Opus-MT、T5），GenAI 没有对应的
+text2text pipeline，这类模型在导出阶段就会失败。
 
 镜像由 GitHub Actions 构建并推到 `ghcr.io/dream10201/z2e:latest`，
 压缩后约 **0.6 GB**，包含 Intel iGPU 驱动、OpenVINO GenAI 运行时和模型导出工具链。
@@ -124,7 +130,24 @@ for chunk in r:
 
 `stream=true` 走标准 SSE。服务不做 prompt 包装，消息原样过模型自带的
 chat template，怎么用模型由客户端决定。Cline 这类 agent 客户端发的 content
-分段数组和 `tool` 角色也能收（文本段拼接、图片段丢弃——模型不支持视觉）。
+分段数组和 `tool` 角色也能收。
+
+**发图（VLM 模型）**：content 分段数组里的 `image_url` 按标准 OpenAI 格式收，
+`data:` base64 和 `http/https` 都认，图片在消息里的位置会保留：
+
+```bash
+curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": [
+    {"type": "text", "text": "这张图里有什么？"},
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,...."}}
+  ]}]
+}'
+```
+
+当前模型是纯文本模型时图片段照旧丢弃、只留文本（Cline 这类客户端会给文本模型
+发截图，硬拒会把它们打断）；当前模型是不是 VLM 看 `GET /health` 的
+`multimodal` 字段。图片下载上限 20 MB（`IMAGE_MAX_BYTES`）、超时 15s
+（`IMAGE_FETCH_TIMEOUT`）。
 
 **工具调用（tools）**：标准 OpenAI 协议——请求带 `tools` 函数签名，
 响应给 `tool_calls` + `finish_reason: "tool_calls"`，流式下 `tool_calls` 作为
@@ -207,6 +230,8 @@ root 有 `CAP_DAC_OVERRIDE`，直接绕过权限位；另外不少系统上 `ren
 | `OV_THREADS` | `4` | CPU 推理线程数（只在 `OV_DEVICE=CPU` 时生效） |
 | `OV_PREFIX_CACHING` | `0` | `1` 开前缀缓存（continuous-batching 后端），agent 长对话 TTFT 明显降；KV cache 常驻内存，紧张的机器可能装不下 |
 | `GEN_WAIT_SECONDS` | `300` | 生成锁排队上限，超时回 503 + `Retry-After` |
+| `IMAGE_MAX_BYTES` | `20971520` | VLM 图片输入的单张大小上限（字节） |
+| `IMAGE_FETCH_TIMEOUT` | `15` | 图片 URL 下载超时（秒） |
 | `ADMIN_TOKEN` | 空（不鉴权） | 设置后 `/admin/*` 需要 `Authorization: Bearer <token>` |
 | `MODEL_ALLOWLIST` | 空 | 限制能切换/自动导出的模型，逗号分隔 repo id，`*` 放开；不设时本地模型随便切、自动导出只认内置 N305 清单 |
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | 直接 `python server.py` 时的监听地址（compose 里用 `API_PORT` 改宿主机端口） |
@@ -219,7 +244,7 @@ root 有 `CAP_DAC_OVERRIDE`，直接绕过权限位；另外不少系统上 `ren
 | `WEIGHT_FORMAT` | `int4` | 量化格式：`int4` / `int8` |
 | `GROUP_SIZE` | `128` | INT4 量化分组大小 |
 | `RATIO` | `1.0` | INT4 层占比，`0.8` 表示 20% 层留 INT8 |
-| `EXPORT_TASK` | `text-generation-with-past` | optimum-cli 的导出 task |
+| `EXPORT_TASK` | `auto` | optimum-cli 的导出 task，auto 按模型架构自动推断（decoder-only 出 text-generation-with-past，VLM 出 image-text-to-text） |
 | `EXPORT_TIMEOUT` | `21600` | `/admin/pull` 后台导出的超时秒数 |
 | `HF_HOME` | `$MODELS_ROOT/.hf` | HF 原始权重缓存目录 |
 | `` | 空 | 国内下载慢设 `https://hf-mirror.com` |
