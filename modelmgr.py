@@ -33,7 +33,7 @@ N305_SAFE_MODELS = [
     "tencent/Hy-MT2-7B",
     "tencent/Hy-MT2-1.8B",
     "openbmb/MiniCPM5-1B",
-    "Qwen/Qwen3-4B",
+    "Qwen/Qwen3.5-2B",
 ]
 
 
