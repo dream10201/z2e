@@ -143,6 +143,7 @@ class ChatCompletionRequest(BaseModel):
         default=None, ge=1, le=32768, description="新版字段，优先于 max_tokens")
     temperature: float = Field(default=0.0, ge=0.0, le=2.0, description="0 走贪心")
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
+    top_k: int | None = Field(default=None, ge=1, description="不设=不限制；仅采样时生效")
     stop: str | list[str] | None = Field(default=None, description="停止序列，命中即停且不进输出")
     stream: bool = False
     stream_options: StreamOptions | None = None
@@ -238,7 +239,7 @@ def _auto_pull_or_raise(model_ref: str) -> None:
 
 
 def _gen_config(max_tokens: int, temperature: float, top_p: float, rp: float,
-                stop: str | list[str] | None = None):
+                stop: str | list[str] | None = None, top_k: int | None = None):
     cfg = ov_genai.GenerationConfig()
     # prompt 在 _apply_template 里已经过了 chat template，别让 pipeline 再包一层
     # （新版 GenerationConfig 默认 apply_chat_template=True，VLMPipeline 尤其会踩）
@@ -253,6 +254,8 @@ def _gen_config(max_tokens: int, temperature: float, top_p: float, rp: float,
         cfg.do_sample = True
         cfg.temperature = temperature
         cfg.top_p = top_p
+        if top_k is not None:
+            cfg.top_k = top_k
     else:
         cfg.do_sample = False
     return cfg
@@ -630,7 +633,8 @@ def chat_completions(req: ChatCompletionRequest):
         raise HTTPException(400, "messages 不能为空")
 
     max_tokens = req.effective_max_tokens
-    cfg = _gen_config(max_tokens, req.temperature, req.top_p, req.repetition_penalty, req.stop)
+    cfg = _gen_config(max_tokens, req.temperature, req.top_p, req.repetition_penalty,
+                      req.stop, req.top_k)
     cid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
 
