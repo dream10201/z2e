@@ -18,6 +18,7 @@ Qwen-VL / Qwen3.5 系）都能跑。VLM 模型支持 OpenAI 多模态消息格�
 
 环境变量: MODEL_ID / MODELS_ROOT / OV_DEVICE / OV_CACHE / OV_THREADS / WEIGHT_FORMAT
           OV_PREFIX_CACHING=1 开前缀缓存 / GEN_WAIT_SECONDS 排队上限
+          SERVE_HOURS 只在时段内驻留模型（如 09:00-18:00），时段外卸载还内存
           ADMIN_TOKEN 设了之后 /admin/* 要带 Authorization: Bearer <token>
           MODEL_ALLOWLIST 限制能切/能自动导出的模型（不设=本地随便切+N305 内置清单）
 """
@@ -30,6 +31,7 @@ import json
 import os
 import queue
 import re
+import sys
 import threading
 import time
 import urllib.request
@@ -48,6 +50,9 @@ DEVICE = os.environ.get("OV_DEVICE", "GPU")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 # 所有生成共用一把锁，忙的时候请求最多排这么久，超了直接 503 让客户端重试
 GEN_WAIT_SECONDS = float(os.environ.get("GEN_WAIT_SECONDS", "300"))
+# 只在这个时段驻留模型（本地时间，"HH:MM-HH:MM"，支持跨零点如 "22:00-06:00"）。
+# 时段外卸载模型把内存还给宿主机，请求回 503；空 = 全天服务
+SERVE_HOURS = os.environ.get("SERVE_HOURS", "")
 
 _mgr = modelmgr.PipelineManager(DEVICE, os.environ.get("OV_CACHE"))
 _exporter = modelmgr.Exporter()
@@ -56,16 +61,92 @@ _exporter = modelmgr.Exporter()
 _CANCEL = getattr(ov_genai.StreamingStatus, "CANCEL", ov_genai.StreamingStatus.STOP)
 
 
+def _parse_serve_hours(spec: str) -> tuple[int, int] | None:
+    """"HH:MM-HH:MM" -> (起, 止) 分钟数；空返回 None（全天服务）。"""
+    if not spec.strip():
+        return None
+
+    def minutes(s: str) -> int:
+        h, _, m = s.strip().partition(":")
+        v = int(h) * 60 + int(m or 0)
+        if not 0 <= v < 24 * 60:
+            raise ValueError(s)
+        return v
+
+    try:
+        a, _, b = spec.partition("-")
+        start, end = minutes(a), minutes(b)
+    except ValueError:
+        raise SystemExit(f"SERVE_HOURS 格式不对: {spec!r}，应为 HH:MM-HH:MM")
+    if start == end:
+        raise SystemExit(f"SERVE_HOURS 起止相同: {spec!r}；全天服务请留空")
+    return start, end
+
+
+_SERVE_WINDOW = _parse_serve_hours(SERVE_HOURS)
+
+
+def _serving_now() -> bool:
+    if _SERVE_WINDOW is None:
+        return True
+    start, end = _SERVE_WINDOW
+    t = time.localtime()
+    cur = t.tm_hour * 60 + t.tm_min
+    if start < end:
+        return start <= cur < end
+    return cur >= start or cur < end  # 跨零点
+
+
+def _seconds_until_open() -> int:
+    start, _ = _SERVE_WINDOW
+    t = time.localtime()
+    cur = t.tm_hour * 60 + t.tm_min
+    return max(((start - cur) % (24 * 60)) * 60, 60)
+
+
+# 时段外被卸载的模型，等窗口再开时装回这一个
+_resume_entry: modelmgr.ModelEntry | None = None
+
+
+async def _serve_hours_watcher() -> None:
+    global _resume_entry
+    while True:
+        await asyncio.sleep(60)
+        try:
+            if not _serving_now() and _mgr.current is not None:
+                # 拿生成锁，等正在跑的请求结束再卸，别把人家生成到一半掐了
+                await asyncio.to_thread(_mgr.gen_lock.acquire)
+                try:
+                    if not _serving_now() and _mgr.current is not None:
+                        _resume_entry = _mgr.current
+                        _mgr.unload()
+                        print(f"[serve-hours] 时段外（SERVE_HOURS={SERVE_HOURS}），"
+                              f"已卸载 {_resume_entry.name}", file=sys.stderr)
+                finally:
+                    _mgr.gen_lock.release()
+            elif _serving_now() and _mgr.current is None and _resume_entry is not None:
+                print(f"[serve-hours] 进入服务时段，装回 {_resume_entry.name}",
+                      file=sys.stderr)
+                await asyncio.to_thread(_mgr.load, _resume_entry)
+        except Exception as e:
+            print(f"[serve-hours] 出错: {e}", file=sys.stderr)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _resume_entry
     # 启动时按 MODEL_ID 预热；没导出就先不加载，等请求指定或调 /admin/pull
     entry = modelmgr.resolve(modelmgr.DEFAULT_MODEL)
     if entry is None:
         reg = modelmgr.scan()
         entry = next(iter(reg.values()), None)
-    if entry is not None:
+    _resume_entry = entry
+    if entry is not None and _serving_now():
         await asyncio.to_thread(_mgr.load, entry)
+    watcher = asyncio.create_task(_serve_hours_watcher()) if _SERVE_WINDOW else None
     yield
+    if watcher is not None:
+        watcher.cancel()
     _mgr.unload()
 
 
@@ -165,6 +246,8 @@ class HealthResponse(BaseModel):
     models_root: str
     available: list[str]
     load_seconds: float
+    serve_hours: str = ""      # SERVE_HOURS 原样；空 = 全天服务
+    serving: bool = True       # 当前是否在服务时段内
 
 
 class LoadRequest(BaseModel):
@@ -197,6 +280,11 @@ def _need(model_ref: str | None) -> modelmgr.ModelEntry:
     没导出但在允许列表里的模型，自动触发后台导出并回 503 + Retry-After——
     导出要几十分钟，不能让这个 HTTP 请求挂着等。
     """
+    if not _serving_now():
+        raise HTTPException(
+            503, f"当前不在服务时段（SERVE_HOURS={SERVE_HOURS}），模型已卸载",
+            headers={"Retry-After": str(_seconds_until_open())},
+        )
     if model_ref:
         entry = modelmgr.resolve(model_ref)
         if entry is None:
@@ -567,14 +655,23 @@ def _generate_stream(prompt: str, cfg, stats: dict[str, int], images: list) -> I
 @app.get("/health", response_model=HealthResponse, tags=["ops"])
 def health():
     cur = _mgr.current
+    serving = _serving_now()
+    if cur is not None:
+        status = "ok"
+    elif not serving:
+        status = "sleeping"    # 时段外主动卸载，不是故障
+    else:
+        status = "no-model"
     return HealthResponse(
-        status="ok" if cur is not None else "no-model",
+        status=status,
         model=cur.name if cur else None,
         multimodal=_mgr.is_vlm,
         device=DEVICE,
         models_root=str(modelmgr.MODELS_ROOT),
         available=sorted(modelmgr.scan()),
         load_seconds=round(_mgr.load_seconds, 2),
+        serve_hours=SERVE_HOURS,
+        serving=serving,
     )
 
 

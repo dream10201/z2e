@@ -233,6 +233,7 @@ root 有 `CAP_DAC_OVERRIDE`，直接绕过权限位；另外不少系统上 `ren
 | `OV_THREADS` | `4` | CPU 推理线程数（只在 `OV_DEVICE=CPU` 时生效） |
 | `OV_PREFIX_CACHING` | `0` | `1` 开前缀缓存（continuous-batching 后端），agent 长对话 TTFT 明显降；KV cache 常驻内存，紧张的机器可能装不下 |
 | `GEN_WAIT_SECONDS` | `300` | 生成锁排队上限，超时回 503 + `Retry-After` |
+| `SERVE_HOURS` | 空（全天服务） | 只在这个时段驻留模型（本地时间，`HH:MM-HH:MM`，支持跨零点如 `22:00-06:00`）。时段外自动卸载模型把内存还给宿主机，请求回 503 + `Retry-After`，进入时段自动装回；`/health` 相应返回 `sleeping` |
 | `IMAGE_MAX_BYTES` | `20971520` | VLM 图片输入的单张大小上限（字节） |
 | `IMAGE_FETCH_TIMEOUT` | `15` | 图片 URL 下载超时（秒） |
 | `ADMIN_TOKEN` | 空（不鉴权） | 设置后 `/admin/*` 需要 `Authorization: Bearer <token>` |

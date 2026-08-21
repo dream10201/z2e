@@ -22,6 +22,9 @@ x-common: &common
     - WEIGHT_FORMAT=${WEIGHT_FORMAT:-int4}
     # 国内下载慢可以设 HF_ENDPOINT=https://hf-mirror.com
     - HF_ENDPOINT=${HF_ENDPOINT:-}
+    # 只在时段内驻留模型（本地时间，如 09:00-18:00，支持跨零点），
+    # 时段外卸载把内存还给宿主机；空 = 全天服务
+    - SERVE_HOURS=${SERVE_HOURS:-}
   shm_size: "2gb"
 
 services:
@@ -35,7 +38,7 @@ services:
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c",
-             "import json,urllib.request,sys; s=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health'))['status']; sys.exit(0 if s=='ok' else 1)"]
+             "import json,urllib.request,sys; s=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health'))['status']; sys.exit(0 if s in ('ok','sleeping') else 1)"]
       interval: 30s
       timeout: 10s
       # 首次要下模型 + 编译 GPU kernel，别让健康检查提前判死
